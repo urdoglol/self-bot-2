@@ -1,7 +1,8 @@
-# selfbot.py | Python 3.10+ | discord.py-self + aiohttp + hcaptcha-challenger
-# sy's selfbot — v2.2.7 (cog-delegated)
+# selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
+# lunar — v2.4.0-access
 
-import discord
+import modifyself_shim as discord   # ← CHANGED (was: import discord)
+
 import asyncio
 import aiohttp
 import json
@@ -150,19 +151,118 @@ TOKEN = (
     or str(_cfg.get("token", "")).strip()
 ).strip('"').strip("'")
 
-print(f"[selfbot] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
+print(f"[lunar] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
 
 if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     print("[FATAL] No token. Set TOKEN env var or config.json")
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.2.7"
+VERSION = "2.4.0-access"
+OWNER_ID = 1551632054574121051   # ← hardcoded fallback, overwritten by access_load()
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) discord/1.0.9044 Chrome/120.0.6099.291 "
               "Electron/28.2.10 Safari/537.36")
+
+# ─────────────────────────────────────────────
+# ACCESS CONTROL
+# ─────────────────────────────────────────────
+
+_admins: set = set()
+_devs: set = set()
+
+ADMIN_COMMANDS = frozenset({
+    "admin",
+    "setadmin", "adminremove", "adminlist",
+    "blacklist", "whitelist",
+    "serverblacklist", "channelblacklist", "rolerestrict",
+    "guards", "perms", "perm",
+    "nuke", "massban", "masskick",
+})
+
+DEVELOPER_COMMANDS = frozenset({
+    "eval", "restart", "reconnect", "proxy", "plugin", "session",
+    "logs",
+    "setdev", "devremove", "devlist",
+    "accesslist",
+})
+
+OWNER_COMMANDS = frozenset({
+    "setowner",
+})
+
+_ACCESS_FILE = "database/access.json"
+
+def _current_owner():
+    # prefer cstate's OWNER_ID — that's where setowner writes
+    try:
+        from cogs import state as cstate
+        v = getattr(cstate, "OWNER_ID", None)
+        if isinstance(v, int):
+            return v
+    except Exception:
+        pass
+    return OWNER_ID
+
+def access_save():
+    try:
+        os.makedirs(os.path.dirname(_ACCESS_FILE), exist_ok=True)
+        with open(_ACCESS_FILE, "w") as f:
+            json.dump({
+                "owner":  _current_owner(),   # ← reads live owner (cstate), not stale __main__
+                "admins": sorted(_admins),
+                "devs":   sorted(_devs),
+            }, f, indent=2)
+    except Exception as e:
+        print(f"[access] save error: {e}")
+
+def access_load():
+    global OWNER_ID, _admins, _devs
+    if not os.path.exists(_ACCESS_FILE):
+        return
+    try:
+        with open(_ACCESS_FILE) as f:
+            d = json.load(f)
+        if isinstance(d.get("owner"), int):
+            OWNER_ID = int(d["owner"])
+        _admins = set(int(x) for x in d.get("admins", []))
+        _devs   = set(int(x) for x in d.get("devs", []))
+        # also seed cstate so the shared reference starts at the right value
+        try:
+            from cogs import state as cstate
+            cstate.OWNER_ID = OWNER_ID
+            cstate._admins  = _admins
+            cstate._devs    = _devs
+        except Exception:
+            pass
+        print(f"[access] loaded owner={OWNER_ID} admins={len(_admins)} devs={len(_devs)}")
+    except Exception as e:
+        print(f"[access] load error: {e}")
+
+def _access_level(uid: int) -> str:
+    if uid == _current_owner():
+        return "owner"
+    if uid in _admins:
+        return "admin"
+    if uid in _devs:
+        return "dev"
+    return "user"
+
+def _access_ok(uid: int, cmd: str) -> bool:
+    lvl = _access_level(uid)
+    if lvl == "owner":
+        return True
+    if cmd in OWNER_COMMANDS:
+        return False
+    if cmd in ADMIN_COMMANDS and lvl != "admin":
+        return False
+    if cmd in DEVELOPER_COMMANDS and lvl != "dev":
+        return False
+    return True
+
+access_load()
 
 # ─────────────────────────────────────────────
 # UI HELPERS
@@ -234,7 +334,8 @@ HELP_DATA = {
         ("quest","list active quests + progress"),("questrun <index>","solve specific quest"),
         ("questall","solve all quests at once"),("autoquest on/off","auto-run quests on startup"),
         ("autoclaim on/off","auto-claim completed quests"),("autoclaim run","sweep and claim now"),
-        ("orbbadge","claim orb badge"),
+        ("orbbadge","claim orb badge"),("questdump [idx]","dump raw quest config"),
+        ("questdiag","show quest diagnostics"),
     ],
     "sniper": [
         ("sniper on/off","toggle nitro gift sniper"),("logger on/off","toggle message logger"),
@@ -245,7 +346,7 @@ HELP_DATA = {
         ("ar remove <trigger>","remove auto-response"),("ar list","list all auto-responses"),
     ],
     "voice": [
-        ("vcjoin [ch_id]","join a voice channel"),("vcleave","leave voice channel"),
+        ("vcjoin <ch_id>","join a voice channel"),("vcleave","leave voice channel"),
         ("vcmute <user_id>","server mute user"),("vcunmute <user_id>","server unmute user"),
         ("vcdeafen <user_id>","server deafen user"),("vcundeafen <user_id>","server undeafen user"),
         ("vckick <user_id>","kick user from vc"),("vcmove <user> <ch_id>","move user to channel"),
@@ -255,6 +356,7 @@ HELP_DATA = {
         ("selfdeaf","toggle your own server deafen"),
         ("selfstream","toggle your stream (go live)"),
         ("selfcamera","toggle your camera/video"),
+        ("vcdiag","voice diagnostics dump"),
     ],
     "rpc": [
         ("rpc <1-6> <field> <value>","set a rich presence slot"),
@@ -262,7 +364,7 @@ HELP_DATA = {
         ("rpc <slot> details <text>","details line"),
         ("rpc <slot> state <text>","state line"),
         ("rpc <slot> type <type>","playing/streaming/listening/watching/competing/purplestream"),
-        ("rpc <slot> platform <preset>","xbox/ps/ps4/ps5/crunchyroll/youtube/twitch/vrchat/meta"),
+        ("rpc <slot> platform <preset>","xbox/ps/ps4/ps5/crunchyroll/youtube/twitch/vrchat/meta/roblox"),
         ("rpc <slot> large_image <url>","large image"),
         ("rpc <slot> small_image <url>","small image"),
         ("rpc <slot> timestamp <val>","3600 | 1:00:00 | clear"),
@@ -277,6 +379,7 @@ HELP_DATA = {
         ("rpc4 <field> <value>","slot 4 shorthand"),
         ("rpc5 <field> <value>","slot 5 shorthand"),
         ("rpc6 <field> <value>","slot 6 shorthand"),
+        ("roblox <game> [- details] [slot]","quick roblox presence"),
         ("spotify <song - artist> [slot]","quick spotify presence"),
         ("youtube <video - channel> [slot]","quick youtube presence"),
         ("xbox <game - details> [slot]","quick xbox presence"),
@@ -330,10 +433,12 @@ HELP_DATA = {
         ("host clear","wipe hosted list + stop sessions"),
     ],
     "admin": [
-        ("admin add <uid>","add an admin"),
-        ("admin remove <uid>","remove an admin"),
-        ("admin list","list admins + owner"),
-        ("admin setowner <uid>","set owner (bootstraps admin system)"),
+        ("admin add <uid>","owner only — grant admin tier"),
+        ("admin remove <uid>","owner only — revoke admin tier"),
+        ("admin devadd <uid>","owner only — grant dev tier"),
+        ("admin devremove <uid>","owner only — revoke dev tier"),
+        ("admin list","list owner + admins + devs"),
+        ("admin setowner <uid>","owner only — transfer ownership"),
     ],
     "lastfm": [
         ("lastfm set <user> [key]","link your last.fm account"),("lastfm np","now playing track"),
@@ -345,7 +450,7 @@ HELP_DATA = {
         ("prefix <new>","change global command prefix"),
         ("serverprefix <p>","set a per-server prefix"),
         ("serverprefixclear","clear per-server prefix"),
-        ("version","show selfbot version"),("reload","reload config from disk"),
+        ("version","show lunar version"),("reload","reload config from disk"),
         ("alias add <cmd> <alias>","add a custom alias"),("alias remove <alias>","remove an alias"),
         ("alias list","list all aliases"),
         ("cooldown set <cmd> <secs>","set command cooldown"),
@@ -423,14 +528,23 @@ HELP_DATA = {
         ("triggers clear","wipe every trigger"),
     ],
     "developer": [
-        ("host say <idx> <msg>","force hosted account to say"),
-        ("host broadcast <msg>","broadcast from all accounts"),
-        ("logs [n]","tail selfbot console"),("eval <code>","evaluate python code"),
-        ("restart","restart the selfbot process"),("reconnect","force gateway reconnect"),
+        ("eval <code>","owner+dev only — evaluate python code"),
+        ("restart","restart the lunar process"),
+        ("reconnect","force gateway reconnect"),
         ("proxy set <url>","set HTTP/SOCKS proxy"),("proxy clear","clear proxy"),
-        ("plugin load <path>","load a plugin from /plugins"),("plugin unload <name>","unload a plugin"),
+        ("plugin load <path>","load a plugin from /plugins"),
+        ("plugin unload <name>","unload a plugin"),
         ("plugin list","list loaded plugins"),
-        ("session switch <idx>","switch active session token"),("session list","list saved sessions"),
+        ("session switch <idx>","switch active session token"),
+        ("session list","list saved sessions"),
+        ("setdev <uid>","owner only — grant developer tier"),
+        ("devremove <uid>","owner only — revoke developer tier"),
+        ("devlist","owner only — list developers"),
+        ("setadmin <uid>","owner only — grant admin tier"),
+        ("adminremove <uid>","owner only — revoke admin tier"),
+        ("adminlist","owner only — list admins"),
+        ("setowner <uid>","owner only — transfer ownership"),
+        ("accesslist","owner only — show owner/admins/devs"),
     ],
     "server": [
         ("serverinfo","current server info"),("members [n]","list server members"),
@@ -500,12 +614,24 @@ HELP_DATA = {
         ("giveaway on/off","auto-enter giveaways"),("nitrosniper on/off","auto-redeem nitro gift codes"),
         ("autoreact <emoji>","auto-react to your own messages"),
         ("autoreactstop","stop auto-react"),
+        ("superreact <emoji> [n]","react to the last n messages concurrently"),
         ("multireact add <emoji>","add emoji to multi-react pool"),
         ("multireact remove <emoji>","remove emoji from pool"),
         ("multireact list","list pool"),("multireact on/off","toggle multi-react"),
         ("autoaddback on/off","auto-accept friend requests"),
         ("vsniper add <code> <gid>","add vanity url to watch list"),
         ("vsniper start/stop/list","vanity sniper control"),
+    ],
+    "spoofer": [
+        ("platform [name]","show or set spoofed platform"),
+        ("spoof <platform>","rewrite IDENTIFY payload + reconnect"),
+        ("spoofer <platform>","alias for spoof"),
+        ("spoof status","show spoofer state"),
+        ("spoof reset","reset to desktop"),
+        ("spoofstatus","show spoofer state"),
+        ("spoofreset","reset to desktop"),
+        ("vr","spoof as VR headset"),("console","spoof as console"),
+        ("spooferdiag","spoofer diagnostics dump"),
     ],
     "profile": [
         ("setpfp <url>","set profile picture from url"),("setbio <text>","set profile bio"),
@@ -639,10 +765,13 @@ def build_help_root(page=1):
         "guards":"blacklists, whitelists, restrictions, per-cmd toggles",
         "resilience":"auto-reconnect, session log, rate limits, cache, queue",
         "tasks":"background task manager","triggers":"message / reaction / voice / member triggers",
-        "developer":"dev tools, plugins, proxy, sessions","server":"server management",
+        "developer":"dev tools, plugins, proxy, sessions, access",
+        "server":"server management",
         "information":"user & server lookup","groupchat":"group dm & anti-gc",
         "utility":"text, afk, translate","tracking":"message & profile tracking",
-        "downloads":"media downloader","social":"friends & social","auto":"automation & snipers",
+        "downloads":"media downloader","social":"friends & social",
+        "auto":"automation, snipers, superreact",
+        "spoofer":"platform / device spoofing",
         "profile":"account profile","status":"custom status",
         "mass":"mass action tools","nuke":"destructive ops + backup","scrape":"scrape & export",
         "webhooks":"webhooks & emoji tools","automod":"automod, raid, quarantine, tickets, verify",
@@ -650,11 +779,11 @@ def build_help_root(page=1):
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
     }
-    lines = [f"  {WHITE}> sy's selfbot{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
+    lines = [f"  {WHITE}> lunar{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
         lines.append(f"  {CYAN}{c:<14}{RESET}  {DIM}{desc.get(c,'commands')}{RESET}")
     lines += ["", f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}",
-              f"  {DIM}page {page}/{total}  •  sy | ver {VERSION}{RESET}"]
+              f"  {DIM}page {page}/{total}  •  lunar | ver {VERSION}{RESET}"]
     return _ansi_block(lines)
 
 def build_help_section(cat, page=1):
@@ -674,7 +803,7 @@ def build_help_section(cat, page=1):
 # STATE
 # ─────────────────────────────────────────────
 
-client = discord.Client(chunk_guilds_at_startup=False, request_guilds=True)
+client = discord.Client(token=TOKEN)
 _MAIN_CLIENT = client
 
 # ── inline state (still owned by selfbot.py) ──
@@ -811,7 +940,7 @@ def decrypt_file(path):
     return True
 
 # ─────────────────────────────────────────────
-# HELPERS STILL OWNED INLINE (called by pre-hooks + cogs)
+# HELPERS STILL OWNED INLINE
 # ─────────────────────────────────────────────
 
 GIFT_RE = re.compile(r"(discord\.gift|discord\.com/gifts)/([a-zA-Z0-9]+)")
@@ -850,7 +979,6 @@ async def translate_text(text, target_lang):
     except Exception as e:
         return f"error: {e}"
 
-# ── neko roleplay gif fetcher ──
 NEKO_ACTIONS = {"feed", "tickle", "slap", "hug", "cuddle", "pat", "kiss",
                 "poke", "wink", "smug", "boop", "nom", "wave", "highfive",
                 "bite", "blush", "dance", "happy", "cringe"}
@@ -1046,8 +1174,6 @@ def task_cancel(name):
 # COG BOOT — fault-tolerant per-module loader
 # ─────────────────────────────────────────────
 
-# Order matters for command collision — later entries overwrite earlier ones.
-# Put adapter cogs that need to WIN a name at the bottom.
 COG_MODULES = [
     ("cogs.quests", "QuestsCog"),
     ("cogs.host", "HostCog"),
@@ -1084,9 +1210,7 @@ COG_MODULES = [
     ("cogs.server", "ServerCog"),
     ("cogs.information", "InformationCog"),
     ("cogs.interactions", "InteractionsCog"),
-    # ── RPC adapter last so its commands win collisions on
-    #    spotify / youtube / xbox / ps / ps4 / crunchy / playing / listening /
-    #    watching / competing / stopactivity / rpc_status / clear_multi_rpc ──
+    ("cogs.spoofer", "SpooferCog"),
     ("cogs.rpc_adapter", "RpcAdapterCog"),
 ]
 
@@ -1102,7 +1226,6 @@ async def _boot_cogs():
     try:
         from cogs import state as cstate
 
-        # feed globals the cogs need
         cstate.CLIENT = client
         cstate.MAIN_CLIENT = _MAIN_CLIENT
         cstate.TOKEN = TOKEN
@@ -1126,7 +1249,6 @@ async def _boot_cogs():
         cstate._has_crypto = _HAS_CRYPTO
         cstate._HAS_CRYPTO = _HAS_CRYPTO
 
-        # adopt existing containers into state (shared references)
         cstate.HOSTED_TOKENS = HOSTED_TOKENS
         cstate._host_sessions = _host_sessions
         cstate._hosted_clients = _hosted_clients
@@ -1184,7 +1306,19 @@ async def _boot_cogs():
         cstate.LOGGER_ENABLED = LOGGER_ENABLED
         cstate._current_platform = _current_platform
 
-        # fault-tolerant per-module import — one bad cog doesn't kill the rest
+        # ── access control (shared by reference — cog mutations propagate) ──
+        cstate.OWNER_ID           = OWNER_ID
+        cstate._admins            = _admins
+        cstate._devs              = _devs
+        cstate.ADMIN_COMMANDS     = ADMIN_COMMANDS
+        cstate.DEVELOPER_COMMANDS = DEVELOPER_COMMANDS
+        cstate.OWNER_COMMANDS     = OWNER_COMMANDS
+        cstate.access_save        = access_save
+        cstate.access_load        = access_load
+        cstate._access_level      = _access_level
+        cstate._access_ok         = _access_ok
+        cstate._current_owner     = _current_owner
+
         for mod_name, cls_name in COG_MODULES:
             try:
                 mod = importlib.import_module(mod_name)
@@ -1230,11 +1364,11 @@ async def on_ready():
     _last_ready_ts = time.time()
     _session_events.append({"ts": _last_ready_ts, "event": "ready", "user": str(client.user)})
 
-    is_main = not hasattr(client, "_bot_index")
-    idx = getattr(client, "_bot_index", "main")
-    print(f"[{idx}] ✓ {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {len(client.guilds)}")
+    is_main = True
+    idx = "main"
+    n_guilds = len(getattr(client._state, "_guilds", {}) or {})
+    print(f"[{idx}] ✓ {client.user} ({client.user.id}) | prefix: {PREFIX} | servers: {n_guilds}")
 
-    # load hosted tokens list
     global HOSTED_TOKENS
     try:
         HOSTED_TOKENS = await async_hosted_tokens_get()
@@ -1255,11 +1389,9 @@ async def on_ready():
     triggers_load()
     tasks_load()
 
-    # boot cogs on main client
     if is_main and not _COGS_BOOTED:
         await _boot_cogs()
 
-    # IPC block (unchanged)
     if is_main and not globals().get("_ipc_initialized"):
         print("[ipc] initializing global state...")
         globals()["_ipc_initialized"] = True
@@ -1288,7 +1420,6 @@ async def on_ready():
         except Exception as e:
             print(f"[ipc] ✗ failed to start: {e}")
 
-    # background loops
     if not any("scheduler" in str(t) for t in asyncio.all_tasks()):
         task_register("scheduler", _scheduler_loop())
     if not any("cache_cleanup" in str(t) for t in asyncio.all_tasks()):
@@ -1306,7 +1437,7 @@ async def on_ready():
             _queue_worker_tasks.append(asyncio.create_task(_queue_worker(f"w{i}")))
 
     try:
-        for g in client.guilds:
+        for g in (client._state._guilds.values() if hasattr(client, "_state") else []):
             if not _monitor["invites"]:
                 continue
             try:
@@ -1362,7 +1493,7 @@ async def _dispatch_message(_client, message):
 
     if LOGGER_ENABLED and message.guild:
         try:
-            log_msg("MSG", f"{message.guild.name}/#{message.channel.name} | "
+            log_msg("MSG", f"{message.guild.name}/#{getattr(message.channel,'name','?')} | "
                             f"{message.author}: {message.content[:100]}")
         except Exception:
             pass
@@ -1447,7 +1578,7 @@ async def _dispatch_message(_client, message):
                     if ch:
                         try:
                             await ch.send(ui_box("keyword", [
-                                f"{message.author} said `{kw}` in {message.channel.mention}"]))
+                                f"{message.author} said `{kw}` in {message.channel.mention if hasattr(message.channel,'mention') else message.channel.id}"]))
                         except Exception:
                             pass
                 break
@@ -1461,15 +1592,18 @@ async def _dispatch_message(_client, message):
         except Exception:
             pass
 
+    # ── AUTO-REACT (concurrent) ──
     if message.author.id == client.user.id and not message.content.startswith(PREFIX):
-        if _autoreact_emoji:
-            try: await message.add_reaction(_autoreact_emoji)
-            except Exception: pass
-        if _multireact_enabled and _multireact_pool:
-            for emoji in _multireact_pool:
-                try: await message.add_reaction(emoji)
-                except Exception: pass
-                await asyncio.sleep(0.15)
+        try:
+            react_tasks = []
+            if _autoreact_emoji:
+                react_tasks.append(message.add_reaction(_autoreact_emoji))
+            if _multireact_enabled and _multireact_pool:
+                react_tasks.extend(message.add_reaction(e) for e in _multireact_pool)
+            if react_tasks:
+                await asyncio.gather(*react_tasks, return_exceptions=True)
+        except Exception:
+            pass
 
     # ── COMMAND GATE ──
 
@@ -1499,6 +1633,19 @@ async def _dispatch_message(_client, message):
         _cooldown_last[key] = time.time()
 
     if not _perm_check(cmd, message):
+        return
+
+    # ── ACCESS GATE — tier enforcement ──
+    if not _access_ok(message.author.id, cmd):
+        lvl = _access_level(message.author.id)
+        need = "owner"
+        if cmd in ADMIN_COMMANDS:      need = "admin"
+        elif cmd in DEVELOPER_COMMANDS: need = "dev"
+        try:
+            await message.edit(content=ui_err(
+                f"`{cmd}` requires {need} access — your tier: {lvl}"))
+        except Exception:
+            pass
         return
 
     db_stats_inc(cmd)
@@ -1544,24 +1691,24 @@ async def on_message(message):
 @client.event
 async def on_message_delete(message):
     if message.author.id == client.user.id: return
-    cid = message.channel.id
+    cid = message.channel_id
     _snipe_cache.setdefault(cid, [])
     _snipe_cache[cid].append({
         "author": str(message.author), "author_id": message.author.id,
         "content": message.content or "",
-        "attachments": [a.url for a in message.attachments] if message.attachments else [],
+        "attachments": [a.get("url") for a in (message.attachments or [])],
         "time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(),
     })
     if len(_snipe_cache[cid]) > SNIPE_LIMIT:
         _snipe_cache[cid] = _snipe_cache[cid][-SNIPE_LIMIT:]
     if LOGGER_ENABLED:
-        log_msg("DEL", f"{message.author} in #{getattr(message.channel,'name','DM')}: {message.content[:100]}")
+        log_msg("DEL", f"{message.author}: {message.content[:100]}")
 
 @client.event
 async def on_message_edit(before, after):
     if before.author.id == client.user.id: return
     if before.content == after.content: return
-    cid = before.channel.id
+    cid = before.channel_id
     _editsnipe_cache.setdefault(cid, [])
     _editsnipe_cache[cid].append({
         "author": str(before.author), "author_id": before.author.id,
@@ -1575,18 +1722,16 @@ async def on_message_edit(before, after):
 
 @client.event
 async def on_member_update(before, after):
-    if _monitor["roles"] and before.roles != after.roles:
-        if _monitor["log_ch"]:
-            ch = client.get_channel(int(_monitor["log_ch"]))
-            if ch:
-                try: await ch.send(ui_box("roles", [f"{after} roles updated"]))
-                except Exception: pass
-    if _monitor["nicks"] and before.nick != after.nick:
-        if _monitor["log_ch"]:
-            ch = client.get_channel(int(_monitor["log_ch"]))
-            if ch:
-                try: await ch.send(ui_box("nick", [f"{after} nick: {before.nick} → {after.nick}"]))
-                except Exception: pass
+    if _monitor["roles"] and _monitor["log_ch"]:
+        ch = client.get_channel(int(_monitor["log_ch"]))
+        if ch:
+            try: await ch.send(ui_box("roles", [f"{after} updated"]))
+            except Exception: pass
+    if _monitor["nicks"] and _monitor["log_ch"]:
+        ch = client.get_channel(int(_monitor["log_ch"]))
+        if ch:
+            try: await ch.send(ui_box("nick", [f"{after} updated"]))
+            except Exception: pass
 
 # ─────────────────────────────────────────────
 # SIGNAL HANDLING + RUN
@@ -1604,11 +1749,9 @@ def _install_signal_handlers():
 
 _install_signal_handlers()
 
-print(f"[selfbot] starting — prefix: '{PREFIX}' — v{VERSION}")
+print(f"[lunar] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
-    client.run(TOKEN)
-except discord.LoginFailure as e:
-    print(f"[FATAL] login failed: {e}")
+    client.run()   # ← modifyself takes token at init, not at run()
+except Exception as e:
+    print(f"[FATAL] run failed: {type(e).__name__}: {e}")
     sys.exit(1)
-except KeyboardInterrupt:
-    print("[shutdown]")
