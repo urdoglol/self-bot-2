@@ -1,5 +1,4 @@
-# language: Python, file: cogs/spoofer.py
-# platform pool spoofing — rotate / random / sticky across gateway reconnects
+# cogs/spoofer.py | platform pool spoofing — rotate / random / sticky + watchdog
 import asyncio
 import importlib
 import inspect
@@ -11,39 +10,117 @@ import modifyself_shim as discord
 from . import state as S
 
 
+# ============================================================
+# ui wrappers — fall back if state helpers missing
+# ============================================================
+def _ansi(lines):
+    fn = getattr(S, "_ansi_block", None)
+    if callable(fn):
+        try:
+            return fn(lines)
+        except Exception:
+            pass
+    body = "\n".join("> " + str(l) for l in lines)
+    return "> ```ansi\n" + body + "\n> ```"
+
+
+def _ui_ok(msg):
+    fn = getattr(S, "ui_ok", None)
+    if callable(fn):
+        try:
+            return fn(msg)
+        except Exception:
+            pass
+    return _ansi([f"  \u2713  {msg}"])
+
+
+def _ui_err(msg):
+    fn = getattr(S, "ui_err", None)
+    if callable(fn):
+        try:
+            return fn(msg)
+        except Exception:
+            pass
+    return _ansi([f"  \u2717  {msg}"])
+
+
+def _ui_info(msg):
+    fn = getattr(S, "ui_info", None)
+    if callable(fn):
+        try:
+            return fn(msg)
+        except Exception:
+            pass
+    return _ansi([f"  \u2022  {msg}"])
+
+
+async def _reply(message, content):
+    try:
+        await message.edit(content=content)
+        return True
+    except Exception:
+        pass
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        await message.channel.send(content)
+        return True
+    except Exception as e:
+        print(f"[spoofer] _reply failed: {e}")
+        return False
+
+
+# ============================================================
+# platform presets
+# ============================================================
 PLATFORM_PRESETS = {
-    "desktop":     {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Windows Desktop"},
-    "windows":     {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Windows Desktop"},
-    "macos":       {"os": "Mac OS X", "browser": "Chrome",          "device": "",             "label": "macOS Desktop"},
-    "linux":       {"os": "Linux",    "browser": "Chrome",          "device": "",             "label": "Linux Desktop"},
-    "web":         {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Web (Chrome)"},
-    "browser":     {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Web (Chrome)"},
-    "phone":       {"os": "Android",  "browser": "Discord Android", "device": "Android",      "label": "Phone (Android)"},
-    "mobile":      {"os": "Android",  "browser": "Discord Android", "device": "Android",      "label": "Phone (Android)"},
-    "android":     {"os": "Android",  "browser": "Discord Android", "device": "Android",      "label": "Android"},
-    "ios":         {"os": "iOS",      "browser": "Discord iOS",     "device": "iPhone",       "label": "iOS"},
-    "iphone":      {"os": "iOS",      "browser": "Discord iOS",     "device": "iPhone",       "label": "iPhone"},
-    "ipad":        {"os": "iOS",      "browser": "Discord iOS",     "device": "iPad",         "label": "iPad"},
-    "console":     {"os": "Windows",  "browser": "Chrome",          "device": "console",      "label": "Console"},
-    "xbox":        {"os": "Windows",  "browser": "Chrome",          "device": "xbox",         "label": "Xbox"},
-    "playstation": {"os": "Windows",  "browser": "Chrome",          "device": "playstation",  "label": "PlayStation"},
-    "ps":          {"os": "Windows",  "browser": "Chrome",          "device": "playstation",  "label": "PlayStation"},
-    "vr":          {"os": "Android",  "browser": "Discord VR",      "device": "Quest",        "label": "VR Headset"},
-    "quest":       {"os": "Android",  "browser": "Discord VR",      "device": "Quest 3",      "label": "Meta Quest"},
-    "quest2":      {"os": "Android",  "browser": "Discord VR",      "device": "Quest 2",      "label": "Meta Quest 2"},
-    "embedded":    {"os": "Windows",  "browser": "Chrome",          "device": "",             "label": "Embedded"},
+    "desktop":     {"os": "Windows",  "browser": "Chrome",          "device": "",            "label": "Windows Desktop"},
+    "windows":     {"os": "Windows",  "browser": "Chrome",          "device": "",            "label": "Windows Desktop"},
+    "macos":       {"os": "Mac OS X", "browser": "Chrome",          "device": "",            "label": "macOS Desktop"},
+    "linux":       {"os": "Linux",    "browser": "Chrome",          "device": "",            "label": "Linux Desktop"},
+    "web":         {"os": "Windows",  "browser": "Chrome",          "device": "",            "label": "Web (Chrome)"},
+    "browser":     {"os": "Windows",  "browser": "Chrome",          "device": "",            "label": "Web (Chrome)"},
+    "phone":       {"os": "Android",  "browser": "Discord Android", "device": "Android",     "label": "Phone (Android)"},
+    "mobile":      {"os": "Android",  "browser": "Discord Android", "device": "Android",     "label": "Phone (Android)"},
+    "android":     {"os": "Android",  "browser": "Discord Android", "device": "Android",     "label": "Android"},
+    "ios":         {"os": "iOS",      "browser": "Discord iOS",     "device": "iPhone",      "label": "iOS"},
+    "iphone":      {"os": "iOS",      "browser": "Discord iOS",     "device": "iPhone",      "label": "iPhone"},
+    "ipad":        {"os": "iOS",      "browser": "Discord iOS",     "device": "iPad",        "label": "iPad"},
+    "console":     {"os": "Windows",  "browser": "Chrome",          "device": "console",     "label": "Console"},
+    "xbox":        {"os": "Windows",  "browser": "Chrome",          "device": "xbox",        "label": "Xbox"},
+    "playstation": {"os": "Windows",  "browser": "Chrome",          "device": "playstation", "label": "PlayStation"},
+    "ps":          {"os": "Windows",  "browser": "Chrome",          "device": "playstation", "label": "PlayStation"},
+    "vr":          {"os": "Android",  "browser": "Discord VR",      "device": "Quest",       "label": "VR Headset"},
+    "quest":       {"os": "Android",  "browser": "Discord VR",      "device": "Quest 3",     "label": "Meta Quest"},
+    "quest2":      {"os": "Android",  "browser": "Discord VR",      "device": "Quest 2",     "label": "Meta Quest 2"},
+    "embedded":    {"os": "Windows",  "browser": "Chrome",          "device": "",            "label": "Embedded"},
+}
+
+UA_MAP = {
+    ("Android", "Discord Android"): "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36",
+    ("Android", "Discord VR"):      "Mozilla/5.0 (Linux; Android 12; Quest 3) AppleWebKit/537.36 (KHTML, like Gecko) OculusBrowser/37.0.0.0.43 SamsungBrowser/4.0 Chrome/122.0.6261.140 VR Safari/537.36",
+    ("iOS", "Discord iOS"):         "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+    ("Windows", "Chrome"):          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    ("Mac OS X", "Chrome"):         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    ("Linux", "Chrome"):            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
 }
 
 
+# ============================================================
+# module state
+# ============================================================
 _LIVE_COG = [None]
 _POOL_STATE = [{
     "mode":   "rotate",   # rotate | random | sticky
-    "pool":   [],         # list of preset dicts
-    "keys":   [],         # parallel list of preset keys
+    "pool":   [],
+    "keys":   [],
     "cursor": 0,
     "last":   None,
 }]
 _GW_CACHE = {"cls": None, "path": None, "scanned": False}
+_CALL_COUNT = [0]
 
 
 # ============================================================
@@ -65,7 +142,7 @@ def _walk_modifyself():
 
 
 def _find_gw_class(force=False):
-    if _GW_CACHE["scanned"] and not force:
+    if _GW_CACHE["scanned"] and not force and _GW_CACHE["cls"] is not None:
         return _GW_CACHE["cls"], _GW_CACHE["path"]
     candidates = []
     for mod in _walk_modifyself():
@@ -84,10 +161,14 @@ def _find_gw_class(force=False):
                 continue
             score = 0
             low, modlow = cname.lower(), mn.lower()
-            if "websocket" in low or "gateway" in low: score += 10
-            if "discord" in low:                        score += 2
-            if "gateway" in modlow:                     score += 5
-            if "ws" in modlow or "websocket" in modlow: score += 3
+            if "websocket" in low or "gateway" in low:
+                score += 10
+            if "discord" in low:
+                score += 2
+            if "gateway" in modlow:
+                score += 5
+            if "ws" in modlow or "websocket" in modlow:
+                score += 3
             candidates.append((score, cobj, f"{mn}.{cname}"))
     _GW_CACHE["scanned"] = True
     if not candidates:
@@ -112,7 +193,7 @@ def _find_client_gateway(client):
 
 
 # ============================================================
-# pool rotation
+# pool logic
 # ============================================================
 def _pick_preset():
     st = _POOL_STATE[0]
@@ -124,7 +205,6 @@ def _pick_preset():
         return pool[0]
     if mode == "random":
         return random.choice(pool)
-    # rotate (default) — sequential, wraps
     idx = st["cursor"] % len(pool)
     st["cursor"] = idx + 1
     return pool[idx]
@@ -134,13 +214,20 @@ def _pool_keys():
     return _POOL_STATE[0]["keys"]
 
 
+def _sync_platform_attr():
+    st = _POOL_STATE[0]
+    try:
+        S._current_platform = ",".join(st["keys"]) if st["keys"] else "desktop"
+    except Exception:
+        pass
+
+
 def _set_pool(keys):
     st = _POOL_STATE[0]
     st["pool"] = [PLATFORM_PRESETS[k] for k in keys if k in PLATFORM_PRESETS]
     st["keys"] = [k for k in keys if k in PLATFORM_PRESETS]
     st["cursor"] = 0
-    # keep state module in sync with a comma-joined view
-    S._current_platform = ",".join(st["keys"]) if st["keys"] else "desktop"
+    _sync_platform_attr()
 
 
 def _add_key(key):
@@ -151,7 +238,7 @@ def _add_key(key):
         return False
     st["keys"].append(key)
     st["pool"].append(PLATFORM_PRESETS[key])
-    S._current_platform = ",".join(st["keys"])
+    _sync_platform_attr()
     return True
 
 
@@ -164,7 +251,7 @@ def _remove_key(key):
     st["pool"].pop(i)
     if st["cursor"] > len(st["pool"]):
         st["cursor"] = 0
-    S._current_platform = ",".join(st["keys"]) if st["keys"] else "desktop"
+    _sync_platform_attr()
     return True
 
 
@@ -181,43 +268,23 @@ def _rewrite_identify_dict(data, preset):
     props["os"]      = preset["os"]
     props["browser"] = preset["browser"]
     props["device"]  = preset["device"]
-
-    ua_map = {
-        ("Android", "Discord Android"): (
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/150.0.0.0 Mobile Safari/537.36"),
-        ("Android", "Discord VR"): (
-            "Mozilla/5.0 (Linux; Android 12; Quest 3) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) OculusBrowser/37.0.0.0.43 "
-            "SamsungBrowser/4.0 Chrome/122.0.6261.140 VR Safari/537.36"),
-        ("iOS", "Discord iOS"): (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"),
-        ("Windows", "Chrome"): (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
-        ("Mac OS X", "Chrome"): (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
-        ("Linux", "Chrome"): (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
-    }
-    key = (preset["os"], preset["browser"])
-    if key in ua_map:
-        props["browser_user_agent"] = ua_map[key]
-
+    ua = UA_MAP.get((preset["os"], preset["browser"]))
+    if ua:
+        props["browser_user_agent"] = ua
     cog = _LIVE_COG[0]
     if cog is not None:
-        cog._last_props = dict(props)
-        cog._identify_count += 1
+        try:
+            cog._last_props = dict(props)
+            cog._identify_count += 1
+        except Exception:
+            pass
     _POOL_STATE[0]["last"] = preset
-    print(f"[spoofer] rewrote IDENTIFY → {preset['label']}")
+    print(f"[spoofer] rewrote IDENTIFY -> {preset['label']}")
     return True
 
 
 # ============================================================
-# patches
+# gateway patches
 # ============================================================
 def _install_patches():
     gw_class, found_path = _find_gw_class()
@@ -227,7 +294,6 @@ def _install_patches():
     if getattr(gw_class, "_spoofer_patched", False):
         print(f"[spoofer] class patch already installed at {found_path}")
         return True
-
     original_send = gw_class.send_json
 
     async def patched_send_json(self, data):
@@ -252,7 +318,6 @@ def _install_instance_patch(client):
         return False
     if getattr(gw, "_spoofer_instance_patched", False):
         return True
-
     original_send = gw.send_json
 
     async def patched_send_json(data):
@@ -265,8 +330,20 @@ def _install_instance_patch(client):
             print(f"[spoofer] instance send_json patch error: {e}")
         return await original_send(data)
 
-    gw.send_json = patched_send_json
-    gw._spoofer_instance_patched = True
+    try:
+        gw.send_json = patched_send_json
+    except AttributeError:
+        # read-only — class patch already covers it
+        print("[spoofer] instance.send_json is read-only (slots?) — class patch handles it")
+        return False
+    except Exception as e:
+        print(f"[spoofer] instance patch assign failed: {e}")
+        return False
+
+    try:
+        gw._spoofer_instance_patched = True
+    except Exception:
+        pass
     print(f"[spoofer] instance patch installed: client.{attr} "
           f"({type(gw).__module__}.{type(gw).__name__})")
     return True
@@ -279,17 +356,6 @@ class SpooferCog:
     COMMANDS = {"platform", "spoof", "spoofer", "vr", "console",
                 "spoofreset", "spoofstatus", "spooferdiag"}
 
-    commands = {
-        "platform":     "_cmd_platform",
-        "spoof":        "_cmd_spoof",
-        "spoofer":      "_cmd_spoof",
-        "vr":           "_cmd_vr",
-        "console":      "_cmd_console",
-        "spoofreset":   "_cmd_spoofreset",
-        "spoofstatus":  "_cmd_spoofstatus",
-        "spooferdiag":  "_cmd_spooferdiag",
-    }
-
     def __init__(self):
         self.bot = None
         self._last_props = None
@@ -300,12 +366,10 @@ class SpooferCog:
         self._instance_patched_attr = None
         _LIVE_COG[0] = self
 
-        # default pool: desktop only
         _set_pool(["desktop"])
 
         try:
-            class_ok = _install_patches()
-            print(f"[spoofer] init — class patch: {'OK' if class_ok else 'FAILED'}")
+            _install_patches()
         except Exception:
             print("[spoofer] init class patch raised:")
             traceback.print_exc()
@@ -316,21 +380,32 @@ class SpooferCog:
             print("[spoofer] init watchdog raised:")
             traceback.print_exc()
 
+        print("[spoofer] cog ready — " + ", ".join(sorted(self.COMMANDS)))
+
     # --------------------------------------------------------
     def _ensure_instance_patch(self):
         if self._instance_patched_attr:
             return True
+        # class patch already covers every instance — nothing to do here
+        try:
+            cls, path = _find_gw_class()
+            if cls is not None and getattr(cls, "_spoofer_patched", False):
+                self._instance_patched_attr = "class:" + (path or "?")
+                return True
+        except Exception:
+            pass
         try:
             client = S.CLIENT
             if client is None:
                 return False
             if _install_instance_patch(client):
                 attr, _ = _find_client_gateway(client)
-                self._instance_patched_attr = attr
+                self._instance_patched_attr = attr or "instance"
                 return True
-        except Exception:
-            print("[spoofer] _ensure_instance_patch raised:")
-            traceback.print_exc()
+        except Exception as e:
+            # never spam the log on every watchdog tick — mark as covered
+            self._instance_patched_attr = "skipped: " + type(e).__name__
+            print(f"[spoofer] instance patch skipped: {e}")
         return False
 
     def _start_watchdog(self):
@@ -349,9 +424,9 @@ class SpooferCog:
                     _, gw = _find_client_gateway(client)
                     now = time.time()
                     if gw is not None and now >= self._reconnect_grace_until:
-                        is_connected = bool(getattr(gw, "is_connected", False))
-                        is_closed    = bool(getattr(gw, "is_closed", False))
-                        if not is_connected and not is_closed:
+                        is_conn   = bool(getattr(gw, "is_connected", False))
+                        is_closed = bool(getattr(gw, "is_closed", False))
+                        if not is_conn and not is_closed:
                             if dead_since == 0.0:
                                 dead_since = now
                             elif now - dead_since > 15:
@@ -374,21 +449,23 @@ class SpooferCog:
             lines.append(f"class patch:    {'YES' if class_ok else 'NO'}")
         except Exception as e:
             lines.append(f"class scan err: {e}")
-
         try:
             client = S.CLIENT
             attr, gw = _find_client_gateway(client)
             inst_ok = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
-            lines.append(f"client attr:    {attr or '—'}")
+            if not inst_ok and self._instance_patched_attr:
+                inst_ok = True
+            lines.append(f"client attr:    {attr or '-'}")
             lines.append(f"instance patch: {'YES' if inst_ok else 'NO'}")
             lines.append(f"pool mode:      {st['mode']}")
-            lines.append(f"pool keys:      {', '.join(st['keys']) or '—'}")
+            lines.append(f"pool keys:      {', '.join(st['keys']) or '-'}")
             lines.append(f"pool size:      {len(st['pool'])}")
             lines.append(f"cursor:         {st['cursor']}")
-            lines.append(f"last pick:      {st['last']['label'] if st['last'] else '—'}")
+            lines.append(f"last pick:      {st['last']['label'] if st['last'] else '-'}")
             lines.append(f"identify count: {self._identify_count}")
             lines.append(f"reconnect cnt:  {self._reconnect_count}")
-            lines.append(f"reconnect grace:{max(0, int(self._reconnect_grace_until - time.time()))}s")
+            lines.append(f"grace:          {max(0, int(self._reconnect_grace_until - time.time()))}s")
+            lines.append(f"handle calls:   {_CALL_COUNT[0]}")
             if gw is not None:
                 try:
                     gws = gw.get_state() if hasattr(gw, "get_state") else {}
@@ -402,15 +479,6 @@ class SpooferCog:
             lines.append(f"client scan err: {e}")
         return lines
 
-    def _current_preset_label(self):
-        st = _POOL_STATE[0]
-        if not st["keys"]:
-            return "—"
-        if len(st["keys"]) == 1:
-            return PLATFORM_PRESETS[st["keys"][0]]["label"]
-        return f"pool[{len(st['keys'])}] ({st['mode']})"
-
-    # --------------------------------------------------------
     async def _safe_reconnect(self):
         client = S.CLIENT
         if client is None:
@@ -418,7 +486,6 @@ class SpooferCog:
         self._reconnect_count += 1
         print(f"[spoofer] reconnect #{self._reconnect_count} requested")
         self._reconnect_grace_until = time.time() + 30
-
         rc = getattr(client, "reconnect_gateway", None)
         if callable(rc):
             try:
@@ -428,83 +495,56 @@ class SpooferCog:
                 return
             except Exception as e:
                 print(f"[spoofer] reconnect_gateway raised: {e}")
-
         _, gw = _find_client_gateway(client)
         if gw is not None and hasattr(gw, "close"):
             try:
                 await gw.close(code=1000)
-                print(f"[spoofer] reconnect via ws.close")
+                print("[spoofer] reconnect via ws.close")
                 return
             except Exception as e:
                 print(f"[spoofer] ws.close raised: {e}")
-
         if hasattr(client, "close"):
             try:
                 await client.close()
-                print(f"[spoofer] reconnect via client.close")
+                print("[spoofer] reconnect via client.close")
                 return
             except Exception as e:
                 print(f"[spoofer] client.close raised: {e}")
 
     # --------------------------------------------------------
-    # entry-point aliases
-    # --------------------------------------------------------
     async def handle(self, message, cmd=None, args=None):
-        await self._dispatch(message, cmd, args)
-
-    async def on_message(self, message, cmd=None, args=None):
-        await self._dispatch(message, cmd, args)
-
-    async def execute(self, message, cmd=None, args=None):
-        await self._dispatch(message, cmd, args)
-
-    async def run_command(self, message, cmd=None, args=None):
-        await self._dispatch(message, cmd, args)
-
-    async def dispatch(self, message, cmd=None, args=None):
-        await self._dispatch(message, cmd, args)
-
-    async def process(self, message, cmd=None, args=None):
-        await self._dispatch(message, cmd, args)
-
-    async def on_command(self, message, cmd=None, args=None):
-        await self._dispatch(message, cmd, args)
-
-    async def _cmd_platform(self, message, args=None):
-        await self._dispatch(message, "platform", args)
-
-    async def _cmd_spoof(self, message, args=None):
-        await self._dispatch(message, "spoof", args)
-
-    async def _cmd_vr(self, message, args=None):
-        await self._dispatch(message, "vr", args)
-
-    async def _cmd_console(self, message, args=None):
-        await self._dispatch(message, "console", args)
-
-    async def _cmd_spoofreset(self, message, args=None):
-        await self._dispatch(message, "spoofreset", args)
-
-    async def _cmd_spoofstatus(self, message, args=None):
-        await self._dispatch(message, "spoofstatus", args)
-
-    async def _cmd_spooferdiag(self, message, args=None):
-        await self._dispatch(message, "spooferdiag", args)
-
-    # --------------------------------------------------------
-    async def _dispatch(self, message, cmd=None, args=None):
+        _CALL_COUNT[0] += 1
+        print(f"[spoofer] handle called cmd={cmd!r} args={args!r}")
         try:
             await self._dispatch_inner(message, cmd, args)
         except Exception as e:
-            tb = traceback.format_exc()
             print("[spoofer] DISPATCH RAISED:")
-            print(tb)
+            traceback.print_exc()
             short = f"{type(e).__name__}: {e}"
             try:
-                await message.edit(content=S.ui_err(f"`spoofer` crash — {short}"))
+                await _reply(message, _ui_err(f"`spoofer` crash — {short}"))
             except Exception:
                 pass
 
+    async def on_message(self, message, cmd=None, args=None):
+        await self.handle(message, cmd, args)
+
+    async def execute(self, message, cmd=None, args=None):
+        await self.handle(message, cmd, args)
+
+    async def run_command(self, message, cmd=None, args=None):
+        await self.handle(message, cmd, args)
+
+    async def dispatch(self, message, cmd=None, args=None):
+        await self.handle(message, cmd, args)
+
+    async def process(self, message, cmd=None, args=None):
+        await self.handle(message, cmd, args)
+
+    async def on_command(self, message, cmd=None, args=None):
+        await self.handle(message, cmd, args)
+
+    # --------------------------------------------------------
     async def _dispatch_inner(self, message, cmd=None, args=None):
         if cmd is None:
             content = getattr(message, "content", "") or ""
@@ -513,15 +553,12 @@ class SpooferCog:
                 return
             cmd = parts[0].lstrip("$./!").lower()
             args = parts[1:]
-
         if args is None:
             args = []
         elif isinstance(args, str):
             args = args.split()
-
         if isinstance(cmd, str):
             cmd = cmd.lstrip("$./!").lower()
-
         while args and isinstance(args[0], str) and \
                 args[0].lstrip("$./!").lower() == cmd:
             args = args[1:]
@@ -536,7 +573,7 @@ class SpooferCog:
 
         client = S.CLIENT
         if client is None:
-            await message.edit(content=S.ui_err("client not ready"))
+            await _reply(message, _ui_err("client not ready"))
             return
 
         # ---------- spooferdiag ----------
@@ -546,7 +583,7 @@ class SpooferCog:
             for ln in lines:
                 print(f"[spooferdiag] {ln}")
             print("[spooferdiag] ====")
-            await message.edit(content=S._ansi_block(lines))
+            await _reply(message, _ansi(lines))
             return
 
         # ---------- platform ----------
@@ -554,51 +591,48 @@ class SpooferCog:
             if len(args) < 1:
                 st = _POOL_STATE[0]
                 lines = [f"  mode:   {st['mode']}",
-                         f"  pool:   {', '.join(st['keys']) or '—'}",
+                         f"  pool:   {', '.join(st['keys']) or '-'}",
                          f"  cursor: {st['cursor']}",
                          "",
                          "  available:"]
                 for k in sorted(PLATFORM_PRESETS.keys()):
                     lines.append(f"    {k:<12} {PLATFORM_PRESETS[k]['label']}")
-                await message.edit(content=S._ansi_block(lines))
+                await _reply(message, _ansi(lines))
                 return
             plat = args[0].lower()
             if plat == "off":
                 plat = "desktop"
             if plat not in PLATFORM_PRESETS:
-                await message.edit(content=S.ui_err(f"unknown platform: {plat}"))
+                await _reply(message, _ui_err(f"unknown platform: {plat}"))
                 return
             _set_pool([plat])
             _POOL_STATE[0]["mode"] = "sticky"
-            await message.edit(content=S.ui_ok(
-                f"single → {PLATFORM_PRESETS[plat]['label']} (sticky)"))
+            await _reply(message, _ui_ok(
+                f"single -> {PLATFORM_PRESETS[plat]['label']} (sticky)"))
             await self._safe_reconnect()
             return
 
         # ---------- spoof / spoofer ----------
         if cmd in ("spoof", "spoofer"):
             if len(args) < 1:
-                await message.edit(content=S.ui_info(
+                await _reply(message, _ui_info(
                     "usage: spoof <platform> | add <p> | remove <p> | "
                     "pool | mode <rotate|random|sticky> | clear | "
                     "status | reset"))
                 return
             sub = args[0].lower()
 
-            # --- status ---
             if sub == "status":
                 await self._send_status(message)
                 return
 
-            # --- reset ---
             if sub == "reset":
                 _set_pool(["desktop"])
                 _POOL_STATE[0]["mode"] = "sticky"
-                await message.edit(content=S.ui_ok("reset → Desktop (sticky)"))
+                await _reply(message, _ui_ok("reset -> Desktop (sticky)"))
                 await self._safe_reconnect()
                 return
 
-            # --- pool ---
             if sub == "pool":
                 st = _POOL_STATE[0]
                 lines = [f"  mode:   {st['mode']}",
@@ -608,84 +642,76 @@ class SpooferCog:
                          "  keys:"]
                 if st["keys"]:
                     for i, k in enumerate(st["keys"]):
-                        marker = "→" if (st["mode"] == "rotate"
-                                         and i == (st["cursor"] % max(len(st["keys"]), 1)))
+                        marker = "->" if (st["mode"] == "rotate"
+                                          and i == (st["cursor"] % max(len(st["keys"]), 1))) else "  "
                         lines.append(f"    {marker} {k:<12} {PLATFORM_PRESETS[k]['label']}")
                 else:
                     lines.append("    (empty)")
-                await message.edit(content=S._ansi_block(lines))
+                await _reply(message, _ansi(lines))
                 return
 
-            # --- clear ---
             if sub == "clear":
                 _set_pool([])
-                await message.edit(content=S.ui_ok("pool cleared — no spoofing"))
+                await _reply(message, _ui_ok("pool cleared — no spoofing"))
                 return
 
-            # --- add ---
             if sub == "add":
                 if len(args) < 2:
-                    await message.edit(content=S.ui_err("usage: spoof add <platform>"))
+                    await _reply(message, _ui_err("usage: spoof add <platform>"))
                     return
                 key = args[1].lower()
                 if key not in PLATFORM_PRESETS:
-                    await message.edit(content=S.ui_err(f"unknown platform: {key}"))
+                    await _reply(message, _ui_err(f"unknown platform: {key}"))
                     return
                 if _add_key(key):
-                    await message.edit(content=S.ui_ok(
-                        f"added {key} → pool size {len(_pool_keys())}"))
+                    await _reply(message, _ui_ok(
+                        f"added {key} -> pool size {len(_pool_keys())}"))
                 else:
-                    await message.edit(content=S.ui_info(f"{key} already in pool"))
+                    await _reply(message, _ui_info(f"{key} already in pool"))
                 return
 
-            # --- remove ---
             if sub == "remove":
                 if len(args) < 2:
-                    await message.edit(content=S.ui_err("usage: spoof remove <platform>"))
+                    await _reply(message, _ui_err("usage: spoof remove <platform>"))
                     return
                 key = args[1].lower()
                 if _remove_key(key):
-                    await message.edit(content=S.ui_ok(
-                        f"removed {key} → pool size {len(_pool_keys())}"))
+                    await _reply(message, _ui_ok(
+                        f"removed {key} -> pool size {len(_pool_keys())}"))
                 else:
-                    await message.edit(content=S.ui_err(f"{key} not in pool"))
+                    await _reply(message, _ui_err(f"{key} not in pool"))
                 return
 
-            # --- mode ---
             if sub == "mode":
                 if len(args) < 2:
-                    await message.edit(content=S.ui_err(
+                    await _reply(message, _ui_err(
                         "usage: spoof mode <rotate|random|sticky>"))
                     return
                 m = args[1].lower()
                 if m not in ("rotate", "random", "sticky"):
-                    await message.edit(content=S.ui_err(f"unknown mode: {m}"))
+                    await _reply(message, _ui_err(f"unknown mode: {m}"))
                     return
                 _POOL_STATE[0]["mode"] = m
                 _POOL_STATE[0]["cursor"] = 0
-                await message.edit(content=S.ui_ok(f"mode → {m}"))
+                await _reply(message, _ui_ok(f"mode -> {m}"))
                 return
 
-            # --- default: treat as platform shortcut ---
             if sub not in PLATFORM_PRESETS:
-                await message.edit(content=S.ui_err(f"unknown platform: {sub}"))
+                await _reply(message, _ui_err(f"unknown platform: {sub}"))
                 return
             _set_pool([sub])
             _POOL_STATE[0]["mode"] = "sticky"
-            await message.edit(content=S.ui_ok(
-                f"spoofed → {PLATFORM_PRESETS[sub]['label']}"))
+            await _reply(message, _ui_ok(
+                f"spoofed -> {PLATFORM_PRESETS[sub]['label']}"))
             await self._safe_reconnect()
             return
 
         # ---------- vr / console ----------
         if cmd in ("vr", "console"):
-            if cmd not in PLATFORM_PRESETS:
-                await message.edit(content=S.ui_err(f"unknown platform: {cmd}"))
-                return
             _set_pool([cmd])
             _POOL_STATE[0]["mode"] = "sticky"
-            await message.edit(content=S.ui_ok(
-                f"platform → {PLATFORM_PRESETS[cmd]['label']}"))
+            await _reply(message, _ui_ok(
+                f"platform -> {PLATFORM_PRESETS[cmd]['label']}"))
             await self._safe_reconnect()
             return
 
@@ -698,7 +724,7 @@ class SpooferCog:
         if cmd == "spoofreset":
             _set_pool(["desktop"])
             _POOL_STATE[0]["mode"] = "sticky"
-            await message.edit(content=S.ui_ok("platform reset → Desktop"))
+            await _reply(message, _ui_ok("platform reset -> Desktop"))
             await self._safe_reconnect()
             return
 
@@ -708,31 +734,31 @@ class SpooferCog:
         st = _POOL_STATE[0]
         client = S.CLIENT
         _, gw = _find_client_gateway(client)
-
-        state_str = "—"
+        state_str = "-"
         if gw is not None and hasattr(gw, "get_state"):
             try:
                 gws = gw.get_state()
                 state_str = f"{gws.get('state')} / conn={gws.get('is_connected')}"
             except Exception:
                 pass
-
         cls, _ = _find_gw_class()
         class_ok = bool(getattr(cls, "_spoofer_patched", False)) if cls else False
         inst_ok  = bool(getattr(gw, "_spoofer_instance_patched", False)) if gw else False
-
+        if not inst_ok and self._instance_patched_attr:
+            inst_ok = True
         lines = [
             f"  mode:         {st['mode']}",
-            f"  pool:         {', '.join(st['keys']) or '—'}",
+            f"  pool:         {', '.join(st['keys']) or '-'}",
             f"  cursor:       {st['cursor']}",
-            f"  last pick:    {st['last']['label'] if st['last'] else '—'}",
+            f"  last pick:    {st['last']['label'] if st['last'] else '-'}",
             f"  class patch:  {'YES' if class_ok else 'NO'}",
             f"  inst patch:   {'YES' if inst_ok else 'NO'}",
             f"  identify #:   {self._identify_count}",
             f"  reconnects:   {self._reconnect_count}",
+            f"  handle calls: {_CALL_COUNT[0]}",
             f"  gateway:      {state_str}",
-            f"  $os:          {p.get('os', '?')}",
-            f"  $browser:     {p.get('browser', '?')}",
-            f"  $device:      {p.get('device', '?')}",
+            f"  os:           {p.get('os', '?')}",
+            f"  browser:      {p.get('browser', '?')}",
+            f"  device:       {p.get('device', '?')}",
         ]
-        await message.edit(content=S._ansi_block(lines))
+        await _reply(message, _ansi(lines))
