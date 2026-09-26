@@ -1,7 +1,7 @@
 # selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
-# lunar — v2.4.0-access
+# wilt — v2.6.0
 
-import modifyself_shim as discord   # ← CHANGED (was: import discord)
+import modifyself_shim as discord
 
 import asyncio
 import aiohttp
@@ -18,6 +18,7 @@ import sqlite3
 import traceback
 import signal
 import importlib
+import socket
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from collections import defaultdict
@@ -151,20 +152,70 @@ TOKEN = (
     or str(_cfg.get("token", "")).strip()
 ).strip('"').strip("'")
 
-print(f"[lunar] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
+print(f"[wilt] token: {TOKEN[:10]}...{TOKEN[-5:] if len(TOKEN) > 15 else ''}")
 
 if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     print("[FATAL] No token. Set TOKEN env var or config.json")
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.4.0-access"
-OWNER_ID = 1551632054574121051   # ← hardcoded fallback, overwritten by access_load()
+VERSION = "2.6.0"
+OWNER_ID = 1551632054574121051
 LOG_FILE = "message_log.txt"
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) discord/1.0.9044 Chrome/120.0.6099.291 "
               "Electron/28.2.10 Safari/537.36")
+
+# ─────────────────────────────────────────────
+# LATENCY TUNING — global aiohttp session
+# ─────────────────────────────────────────────
+
+_LATENCY_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Authorization": TOKEN,
+}
+
+def _build_connector():
+    try:
+        return aiohttp.TCPConnector(
+            limit=32,
+            limit_per_host=16,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+            force_close=False,
+            use_dns_cache=True,
+        )
+    except TypeError:
+        return aiohttp.TCPConnector(limit=32, limit_per_host=16)
+
+_aio_timeout = aiohttp.ClientTimeout(total=30, connect=5, sock_read=20)
+_GLOBAL_SESSION = None
+
+def _get_session():
+    global _GLOBAL_SESSION
+    if _GLOBAL_SESSION is None or _GLOBAL_SESSION.closed:
+        _GLOBAL_SESSION = aiohttp.ClientSession(
+            headers=_LATENCY_HEADERS,
+            timeout=_aio_timeout,
+            connector=_build_connector(),
+        )
+    return _GLOBAL_SESSION
+
+async def _close_session():
+    global _GLOBAL_SESSION
+    if _GLOBAL_SESSION and not _GLOBAL_SESSION.closed:
+        try:
+            await _GLOBAL_SESSION.close()
+        except Exception:
+            pass
+        _GLOBAL_SESSION = None
+
+def _tcp_nodelay(sock):
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────
 # ACCESS CONTROL
@@ -189,14 +240,11 @@ DEVELOPER_COMMANDS = frozenset({
     "accesslist",
 })
 
-OWNER_COMMANDS = frozenset({
-    "setowner",
-})
+OWNER_COMMANDS = frozenset({"setowner"})
 
 _ACCESS_FILE = "database/access.json"
 
 def _current_owner():
-    # prefer cstate's OWNER_ID — that's where setowner writes
     try:
         from cogs import state as cstate
         v = getattr(cstate, "OWNER_ID", None)
@@ -211,7 +259,7 @@ def access_save():
         os.makedirs(os.path.dirname(_ACCESS_FILE), exist_ok=True)
         with open(_ACCESS_FILE, "w") as f:
             json.dump({
-                "owner":  _current_owner(),   # ← reads live owner (cstate), not stale __main__
+                "owner":  _current_owner(),
                 "admins": sorted(_admins),
                 "devs":   sorted(_devs),
             }, f, indent=2)
@@ -229,7 +277,6 @@ def access_load():
             OWNER_ID = int(d["owner"])
         _admins = set(int(x) for x in d.get("admins", []))
         _devs   = set(int(x) for x in d.get("devs", []))
-        # also seed cstate so the shared reference starts at the right value
         try:
             from cogs import state as cstate
             cstate.OWNER_ID = OWNER_ID
@@ -242,24 +289,41 @@ def access_load():
         print(f"[access] load error: {e}")
 
 def _access_level(uid: int) -> str:
-    if uid == _current_owner():
-        return "owner"
-    if uid in _admins:
-        return "admin"
-    if uid in _devs:
-        return "dev"
+    try:
+        from cogs import state as cstate
+        owner  = getattr(cstate, "OWNER_ID", None)
+        if not isinstance(owner, int):
+            owner = _current_owner()
+        admins = getattr(cstate, "_admins", None)
+        devs   = getattr(cstate, "_devs", None)
+        if admins is None: admins = _admins
+        if devs   is None: devs   = _devs
+    except Exception:
+        owner, admins, devs = _current_owner(), _admins, _devs
+
+    try:
+        if uid == int(owner):  return "owner"
+    except Exception:
+        if uid == owner:       return "owner"
+
+    try:
+        if uid in admins:      return "admin"
+    except TypeError:
+        if uid in set(admins): return "admin"
+
+    try:
+        if uid in devs:        return "dev"
+    except TypeError:
+        if uid in set(devs):   return "dev"
+
     return "user"
 
 def _access_ok(uid: int, cmd: str) -> bool:
     lvl = _access_level(uid)
-    if lvl == "owner":
-        return True
-    if cmd in OWNER_COMMANDS:
-        return False
-    if cmd in ADMIN_COMMANDS and lvl != "admin":
-        return False
-    if cmd in DEVELOPER_COMMANDS and lvl != "dev":
-        return False
+    if lvl == "owner": return True
+    if cmd in OWNER_COMMANDS: return False
+    if cmd in ADMIN_COMMANDS and lvl != "admin": return False
+    if cmd in DEVELOPER_COMMANDS and lvl != "dev": return False
     return True
 
 access_load()
@@ -323,8 +387,6 @@ HELP_DATA = {
         ("ping","latency check"),("info","account snapshot"),("say <text>","replace command with text"),
         ("spam <n> <text>","blast n messages fast"),("spamstop","kill active spam loop"),
         ("purge [n]","delete your last n messages"),("clear","delete command message"),
-        ("snipe [n]","snipe last deleted message"),("snipe clear","wipe snipe cache"),
-        ("editsnipe [n]","snipe last edited message"),("editsnipe clear","wipe edit-snipe cache"),
         ("copycat <id>","mirror next 10 msgs from user"),("status <text>","set custom status"),
         ("status clear","clear status"),("platform <type>","spoof gateway platform"),
         ("platform off","reset platform to desktop"),("hypesquad <house>","set hypesquad house"),
@@ -338,8 +400,145 @@ HELP_DATA = {
         ("questdiag","show quest diagnostics"),
     ],
     "sniper": [
-        ("sniper on/off","toggle nitro gift sniper"),("logger on/off","toggle message logger"),
+        ("sniper on/off","toggle nitro gift sniper"),
+        ("logger on/off","toggle message logger"),
         ("readlog [n]","read last n log lines"),
+        ("snipe [n]","show nth most recent delete"),
+        ("snipe history","list recent 50 deletes in channel"),
+        ("snipe page <n>","paginate through snipe history"),
+        ("snipe search <kw>","filter snipes by keyword"),
+        ("snipe attachments","only entries with attachments"),
+        ("snipe embeds","only entries with embeds"),
+        ("snipe reactions","only entries with reactions"),
+        ("snipe time","show relative timestamps"),
+        ("snipe filter <kind>","attachments | embeds | reactions | text | all"),
+        ("snipe cache","show cache sizes"),
+        ("snipe clear","wipe this channel's snipe cache"),
+        ("snipe purge user <uid>","remove entries by user"),
+        ("snipe purge channel","wipe this channel only"),
+        ("snipe purge server","wipe every channel"),
+        ("snipe ignore add <uid>","stop showing user's snipes"),
+        ("snipe ignore remove <uid>","remove from ignore list"),
+        ("snipe ignore list","show ignored users"),
+        ("snipe ignore clear","wipe ignore list"),
+        ("editsnipe [n]","show nth most recent edit"),
+        ("editsnipe history","list recent edits"),
+        ("editsnipe clear","wipe this channel's editsnipe cache"),
+        ("editsnipe purge user <uid>","remove edits by user"),
+        ("editsnipe purge channel","wipe this channel only"),
+        ("editsnipe purge server","wipe every channel"),
+    ],
+    "afk": [
+        ("afk [msg]","turn AFK on, optional reply"),
+        ("afkstop","turn AFK off"),
+        ("afkreturn","welcome-back ping summary + turn off"),
+        ("afkstatus","show AFK state"),
+        ("afkignore add/remove/list/clear <uid>","ignore a user"),
+        ("afkwhitelist add/remove/list/clear <uid>","whitelist a user"),
+        ("afkblacklist add/remove/list/clear <uid>","blacklist a user"),
+        ("afkcooldown <secs>","per-user reply cooldown"),
+        ("afkdmonly on/off","only reply in DMs"),
+        ("afkexpire <secs>","auto-expire AFK"),
+        ("afkemergency","activate emergency AFK"),
+        ("afkcustom set/remove <uid> [text]","per-user reply text"),
+        ("afkserver set/clear","per-server AFK text"),
+        ("afkpingcount","who pinged you and how often"),
+    ],
+    "loggers": [
+        ("logger <kind> on/off","message/deleted/edited/reaction/mention/dm/joins/leaves"),
+        ("logger all on/off","toggle every logger"),
+        ("logchannel <kind> <ch_id>","set a logger's output channel"),
+        ("logstatus","show every logger state"),
+        ("logmessage on/off","message logger"),
+        ("logdeleted on/off","deleted message logger"),
+        ("logedited on/off","edited message logger"),
+        ("logreaction on/off","reaction logger"),
+        ("logmention on/off","mention logger"),
+        ("logdm on/off","DM logger"),
+        ("logjoins on/off","member join logger"),
+        ("logleaves on/off","member leave logger"),
+    ],
+    "filters": [
+        ("filter <kind> on/off","toggle any filter"),
+        ("filter status","show filter state"),
+        ("filter log <ch_id>","set the filter hit log channel"),
+        ("filterlog","show recent filter hits"),
+        ("filterclear","wipe the filter hit log"),
+        ("antispam [n]","rate-limit protection"),
+        ("antidupe","duplicate message detector"),
+        ("antilink / antiinvite","link & invite blockers"),
+        ("antiattachment","block attachments"),
+        ("antinsfw [add <word>]","nsfw keyword blocker"),
+        ("antimention [n]","mention-spam filter"),
+        ("antimassping","@everyone / @here blocker"),
+        ("antiscam","scam-pattern filter"),
+        ("antibot / antiwebhook","bot & webhook filters"),
+        ("autopurge [n]","keep only n own messages in a channel"),
+    ],
+    "autoresponder": [
+        ("arule add <kind> <patterns> | <reply1> [| reply2]","kind: keyword | regex | any"),
+        ("arule remove <id>","remove a rule"),
+        ("arule scope <id> user/channel/server <id> | clear","per-scope targeting"),
+        ("arule cooldown <id> <secs>","rule cooldown"),
+        ("arules","list every rule"),
+        ("aruleclear","wipe every rule"),
+        ("arvars","list dynamic variables usable in replies"),
+        ("artest <text>","preview a reply with variables substituted"),
+    ],
+    "nickname": [
+        ("autonick on/off","auto-nickname toggle"),
+        ("autonick pattern <text>","template — {user}, {discrim}"),
+        ("autonick interval <secs>","re-apply interval"),
+        ("autonick run","apply right now"),
+        ("nickset <uid> <nick>","manually set a nickname"),
+        ("nickhistory [uid]","nickname change history"),
+        ("nickclear [uid]","clear nickname history"),
+    ],
+    "search": [
+        ("msearch <kw> [limit]","search this channel's history"),
+        ("bulkdel [n] [-a]","delete last n (own only unless -a)"),
+        ("delby <uid> [n]","delete last n from a user"),
+    ],
+    "profileext": [
+        ("avatardl [uid]","save a user's avatar to exports/"),
+        ("bannerdl [uid]","save a user's banner to exports/"),
+        ("profilehistory [uid]","avatar / banner / username change log"),
+        ("usernote add/list/clear <uid> [text]","persistent user notes"),
+        ("personalblock <uid>","add to personal blocklist"),
+        ("personalunblock <uid>","remove from blocklist"),
+        ("personalignore <uid>","add to ignore list"),
+        ("personalunignore <uid>","remove from ignore"),
+        ("personalblocklist","show blocklist"),
+        ("personallist","show block + ignore"),
+    ],
+    "reminders": [
+        ("remind <secs> <text>","schedule a mention reminder"),
+        ("reminders","list pending reminders"),
+        ("delremind <id>","remove a reminder"),
+        ("timer <secs> <label>","countdown timer"),
+        ("timers","list active timers"),
+        ("notify <secs> <title> | <body>","fire a webhook notification"),
+        ("notifications","list pending notifications"),
+    ],
+    "pingtrack": [
+        ("pingcount [uid]","pings by a user"),
+        ("pingtop","leaderboard of pingers"),
+        ("pinglog / mentionlog","full mention history"),
+        ("pingreset [uid|log]","clear counters or mention log"),
+        ("pingtrack on/off","enable mention tracking"),
+        ("pingtrack log <ch_id>","log mentions to a channel"),
+    ],
+    "meta": [
+        ("config export/import/backup","move configuration around"),
+        ("resetconfig confirm","wipe every custom setting"),
+        ("debug on/off","verbose debug output"),
+        ("devmode on/off","expose developer diagnostics"),
+        ("statuswatch on/off/interval","periodic gateway health check"),
+        ("setwebhook <url>","notifications webhook"),
+        ("githubwatch repo/channel/clear","repo event notifications"),
+        ("uptime_mon","process uptime"),
+        ("apistatus","gateway + latency snapshot"),
+        ("errorlog / errorclear","recent error log"),
     ],
     "ar": [
         ("ar add <trigger> | <response>","add auto-response"),
@@ -357,6 +556,20 @@ HELP_DATA = {
         ("selfstream","toggle your stream (go live)"),
         ("selfcamera","toggle your camera/video"),
         ("vcdiag","voice diagnostics dump"),
+    ],
+    "roles": [
+        ("roleinfo <id_or_name>","full role snapshot"),
+        ("rolelist","list every role top-down"),
+        ("rolehierarchy","indented role tree"),
+        ("roleperms <id_or_name>","list granted permissions"),
+        ("rolemembers <id_or_name>","list members with the role"),
+        ("roleposition <id_or_name>","position index"),
+        ("rolecolor <id> [hex]","show or set the role colour"),
+        ("roleid <name>","resolve role name → id"),
+        ("rolementionable <id>","is mentionable"),
+        ("rolehoisted <id>","is hoisted in sidebar"),
+        ("rolemanaged <id>","managed by integration"),
+        ("rolecreated <id>","creation timestamp"),
     ],
     "rpc": [
         ("rpc <1-6> <field> <value>","set a rich presence slot"),
@@ -399,6 +612,7 @@ HELP_DATA = {
         ("remoji <a, b, c>","rotate custom status emoji"),
         ("stopstatus","stop status rotation"),
         ("stopemoji","stop emoji rotation"),
+        ("rpcwatchdog","rpc watchdog status/stop/start"),
     ],
     "fun": [
         ("gayrate [user_id]","gay percentage"),("feed <user_id>","feed a user"),
@@ -450,7 +664,7 @@ HELP_DATA = {
         ("prefix <new>","change global command prefix"),
         ("serverprefix <p>","set a per-server prefix"),
         ("serverprefixclear","clear per-server prefix"),
-        ("version","show lunar version"),("reload","reload config from disk"),
+        ("version","show wilt version"),("reload","reload config from disk"),
         ("alias add <cmd> <alias>","add a custom alias"),("alias remove <alias>","remove an alias"),
         ("alias list","list all aliases"),
         ("cooldown set <cmd> <secs>","set command cooldown"),
@@ -502,6 +716,10 @@ HELP_DATA = {
         ("queue on/off","toggle command queue mode"),
         ("queue workers <n>","set the number of queue workers"),
         ("queue status","show queue state"),
+        ("health","one-line alive + latency check"),
+        ("uptime","bot uptime summary"),
+        ("latency [history [n]]","heartbeat latency samples"),
+        ("incidents","disconnect / reconnect log"),
     ],
     "tasks": [
         ("task list","list background tasks"),
@@ -529,7 +747,7 @@ HELP_DATA = {
     ],
     "developer": [
         ("eval <code>","owner+dev only — evaluate python code"),
-        ("restart","restart the lunar process"),
+        ("restart","restart the wilt process"),
         ("reconnect","force gateway reconnect"),
         ("proxy set <url>","set HTTP/SOCKS proxy"),("proxy clear","clear proxy"),
         ("plugin load <path>","load a plugin from /plugins"),
@@ -561,7 +779,6 @@ HELP_DATA = {
     "information": [
         ("userinfo [user_id]","discord user lookup"),("avatar [user_id]","get user avatar"),
         ("serverinfo","server details"),("channelinfo [ch_id]","channel details"),
-        ("roleinfo <role_id>","role details"),
         ("checkname <username>","check if discord username is taken"),
         ("whois <user_id>","full user profile dump"),
     ],
@@ -614,23 +831,31 @@ HELP_DATA = {
         ("giveaway on/off","auto-enter giveaways"),("nitrosniper on/off","auto-redeem nitro gift codes"),
         ("autoreact <emoji>","auto-react to your own messages"),
         ("autoreactstop","stop auto-react"),
-        ("superreact <emoji> [n]","react to the last n messages concurrently"),
+        ("superreact <emoji>","continuous react to your own messages"),
+        ("superreactstop","stop superreact"),
         ("multireact add <emoji>","add emoji to multi-react pool"),
         ("multireact remove <emoji>","remove emoji from pool"),
         ("multireact list","list pool"),("multireact on/off","toggle multi-react"),
         ("autoaddback on/off","auto-accept friend requests"),
         ("vsniper add <code> <gid>","add vanity url to watch list"),
         ("vsniper start/stop/list","vanity sniper control"),
+        ("reactdiag","show autoreact/superreact state"),
     ],
     "spoofer": [
-        ("platform [name]","show or set spoofed platform"),
-        ("spoof <platform>","rewrite IDENTIFY payload + reconnect"),
+        ("platform [name]","show pool or set a single sticky platform"),
+        ("spoof <platform>","single-platform shortcut — sticky, reconnect"),
         ("spoofer <platform>","alias for spoof"),
-        ("spoof status","show spoofer state"),
-        ("spoof reset","reset to desktop"),
-        ("spoofstatus","show spoofer state"),
-        ("spoofreset","reset to desktop"),
-        ("vr","spoof as VR headset"),("console","spoof as console"),
+        ("spoof add <platform>","add a platform to the rotation pool"),
+        ("spoof remove <platform>","drop a platform from the pool"),
+        ("spoof pool","show the pool, arrow marks next in rotate order"),
+        ("spoof mode <mode>","rotate | random | sticky — how the pool cycles"),
+        ("spoof clear","empty the pool — no rewrite on next IDENTIFY"),
+        ("spoof status","show spoofer state (mode, pool, cursor, last pick)"),
+        ("spoof reset","reset to desktop, sticky mode"),
+        ("spoofstatus","alias for spoof status"),
+        ("spoofreset","alias for spoof reset"),
+        ("vr","spoof as VR headset (sticky)"),
+        ("console","spoof as console (sticky)"),
         ("spooferdiag","spoofer diagnostics dump"),
     ],
     "profile": [
@@ -757,7 +982,19 @@ def build_help_root(page=1):
     chunk = cats[(page-1)*10:(page-1)*10+10]
     desc = {
         "general":"utilities, platform & status","quests":"quest completer & orb badge",
-        "sniper":"nitro sniper & logger","ar":"auto-responder","voice":"voice channel controls",
+        "sniper":"nitro sniper, logger, extended snipe",
+        "afk":"AFK system — whitelist, blacklist, per-server",
+        "loggers":"message / deleted / edited / reaction / join loggers",
+        "filters":"spam, dupe, link, invite, nsfw, mass-ping, scam filters",
+        "autoresponder":"rule engine — keyword, regex, scope, cooldown",
+        "nickname":"auto-nickname + nickname history",
+        "search":"channel search + bulk delete",
+        "profileext":"avatar/banner download, notes, personal block",
+        "reminders":"reminders, timers, webhook notifications",
+        "pingtrack":"ping counters + mention log",
+        "meta":"config I/O, debug, status watch, uptime, github watch",
+        "ar":"auto-responder","voice":"voice channel controls",
+        "roles":"role introspection & colour",
         "rpc":"rich presence — 6 slots, spotify, xbox, ps, vrchat, meta",
         "fun":"fun & roleplay","tools":"tools & generators","host":"multi-account hosting",
         "admin":"owner / admin management",
@@ -779,11 +1016,11 @@ def build_help_root(page=1):
         "perms":"per-command permissions","scheduler":"scheduled actions",
         "db":"local database & stats","interactions":"button & modal handling",
     }
-    lines = [f"  {WHITE}> lunar{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
+    lines = [f"  {WHITE}> wilt{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
     for c in chunk:
         lines.append(f"  {CYAN}{c:<14}{RESET}  {DIM}{desc.get(c,'commands')}{RESET}")
     lines += ["", f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}",
-              f"  {DIM}page {page}/{total}  •  lunar | ver {VERSION}{RESET}"]
+              f"  {DIM}page {page}/{total}  •  wilt | ver {VERSION}{RESET}"]
     return _ansi_block(lines)
 
 def build_help_section(cat, page=1):
@@ -803,10 +1040,9 @@ def build_help_section(cat, page=1):
 # STATE
 # ─────────────────────────────────────────────
 
-client = discord.Client(token=TOKEN)
+client = discord.Client(token=TOKEN, chunk_guilds_at_startup=False)
 _MAIN_CLIENT = client
 
-# ── inline state (still owned by selfbot.py) ──
 AUTO_RESPONSES = {}
 SNIPER_ENABLED = True
 LOGGER_ENABLED = False
@@ -817,12 +1053,13 @@ _afk_msg = None
 _afk_enabled = False
 _typing_tasks = {}
 _autoreact_emoji = None
+_superreact_emoji = None
 _multireact_pool = []
 _multireact_enabled = False
 _spam_tasks = {}
 _snipe_cache = {}
 _editsnipe_cache = {}
-SNIPE_LIMIT = 20
+SNIPE_LIMIT = 50
 
 _autoaddback = False
 _giveaway_enabled = False
@@ -870,7 +1107,8 @@ _TRIGGER_STORE = "database/triggers.json"
 _triggers = {"message": [], "reaction": [], "voice": [], "member": []}
 _trigger_fired_counts = defaultdict(int)
 
-# ── host state ──
+_latency_history = []
+
 _host_sessions: list = []
 _host_lock = None
 
@@ -878,7 +1116,6 @@ HOSTED_TOKENS: list = []
 _hosted_clients: list = []
 _hosted_spawned = False
 
-# ── automod / monitor / verify / quarantine ──
 _monitor = {"joins": False, "leaves": False, "roles": False, "nicks": False,
             "invites": False, "log_ch": None, "keywords": []}
 _invite_cache = {}
@@ -891,12 +1128,10 @@ _buttons_enabled = True
 _modals_enabled = True
 _pending_interactions = []
 
-# ── scheduler / db ──
 _scheduler = []
 _db_path = "database/selfbot.db"
 _db = None
 
-# ── platform / hypesquad ──
 PLATFORM_MAP = {
     "desktop":  "Windows",
     "web":      "Web",
@@ -910,7 +1145,6 @@ _current_platform = "desktop"
 HOUSE_IDS = {"bravery": 1, "brilliance": 2, "balance": 3}
 HOUSE_NAMES = {1: "Bravery", 2: "Brilliance", 3: "Balance"}
 
-# ── crypto ──
 try:
     from cryptography.fernet import Fernet
     _HAS_CRYPTO = True
@@ -940,21 +1174,20 @@ def decrypt_file(path):
     return True
 
 # ─────────────────────────────────────────────
-# HELPERS STILL OWNED INLINE
+# HELPERS
 # ─────────────────────────────────────────────
 
 GIFT_RE = re.compile(r"(discord\.gift|discord\.com/gifts)/([a-zA-Z0-9]+)")
 
 async def snipe_nitro(code, channel_id):
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"https://discord.com/api/v9/entitlements/gift-codes/{code}/redeem",
-                headers={"Authorization": TOKEN, "Content-Type": "application/json",
-                         "User-Agent": USER_AGENT},
-                json={"channel_id": str(channel_id)},
-            ) as r:
-                log_msg("SNIPER", f"{'✓ SNIPED' if r.status == 200 else '✗ miss'} {code} [{r.status}]")
+        s = _get_session()
+        async with s.post(
+            f"https://discord.com/api/v9/entitlements/gift-codes/{code}/redeem",
+            headers={"Content-Type": "application/json"},
+            json={"channel_id": str(channel_id)},
+        ) as r:
+            log_msg("SNIPER", f"{'✓ SNIPED' if r.status == 200 else '✗ miss'} {code} [{r.status}]")
     except Exception as e:
         log_msg("SNIPER", f"error: {e}")
 
@@ -972,10 +1205,10 @@ async def translate_text(text, target_lang):
     try:
         url = "https://translate.googleapis.com/translate_a/single"
         params = {"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t", "q": text}
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
-                d = await r.json()
-                return "".join(p[0] for p in d[0] if p[0])
+        s = _get_session()
+        async with s.get(url, params=params) as r:
+            d = await r.json()
+            return "".join(p[0] for p in d[0] if p[0])
     except Exception as e:
         return f"error: {e}"
 
@@ -986,31 +1219,29 @@ NEKO_ACTIONS = {"feed", "tickle", "slap", "hug", "cuddle", "pat", "kiss",
 async def neko_gif(action):
     endpoint = action if action in NEKO_ACTIONS else "hug"
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"https://nekos.life/api/v2/img/{endpoint}",
-                             timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status == 200:
-                    return (await r.json()).get("url")
+        s = _get_session()
+        async with s.get(f"https://nekos.life/api/v2/img/{endpoint}") as r:
+            if r.status == 200:
+                return (await r.json()).get("url")
     except Exception:
         pass
     return None
 
 async def set_hypesquad(house_id: int):
-    h = {"Authorization": TOKEN, "Content-Type": "application/json", "User-Agent": USER_AGENT}
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post("https://discord.com/api/v9/hypesquad/online",
-                              headers=h, json={"house_id": house_id}) as r:
-                return r.status in (200, 204), await r.text()
+        s = _get_session()
+        async with s.post("https://discord.com/api/v9/hypesquad/online",
+                          headers={"Content-Type": "application/json"},
+                          json={"house_id": house_id}) as r:
+            return r.status in (200, 204), await r.text()
     except Exception as e:
         return False, str(e)
 
 async def clear_hypesquad():
-    h = {"Authorization": TOKEN, "User-Agent": USER_AGENT}
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.delete("https://discord.com/api/v9/hypesquad/online", headers=h) as r:
-                return r.status in (200, 204)
+        s = _get_session()
+        async with s.delete("https://discord.com/api/v9/hypesquad/online") as r:
+            return r.status in (200, 204)
     except Exception:
         return False
 
@@ -1134,10 +1365,23 @@ async def _cache_cleanup_loop():
                     if len(_tracking[uid]) > 200: _tracking[uid] = _tracking[uid][-200:]
                 if len(_session_events) > 200: del _session_events[:-200]
                 if len(_rate_limit_events) > 200: del _rate_limit_events[:-200]
+                if len(_latency_history) > 500: del _latency_history[:-500]
             await asyncio.sleep(600)
         except Exception as e:
             print(f"[cache] {e}")
             await asyncio.sleep(60)
+
+async def _heartbeat_probe_loop():
+    while True:
+        try:
+            await asyncio.sleep(60)
+            lat = getattr(client, "latency", None)
+            if lat is not None:
+                _latency_history.append({"ts": time.time(), "ms": round(lat * 1000, 1)})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[heartbeat probe] {e}")
 
 async def _queue_worker(name):
     while True:
@@ -1171,7 +1415,7 @@ def task_cancel(name):
     return False
 
 # ─────────────────────────────────────────────
-# COG BOOT — fault-tolerant per-module loader
+# COG BOOT
 # ─────────────────────────────────────────────
 
 COG_MODULES = [
@@ -1209,6 +1453,17 @@ COG_MODULES = [
     ("cogs.developer", "DeveloperCog"),
     ("cogs.server", "ServerCog"),
     ("cogs.information", "InformationCog"),
+    ("cogs.rolemgmt", "RoleMgmtCog"),
+    ("cogs.afk", "AfkCog"),
+    ("cogs.loggers", "LoggersCog"),
+    ("cogs.filters", "FiltersCog"),
+    ("cogs.autoresponder", "AutoResponderCog"),
+    ("cogs.nickname", "NicknameCog"),
+    ("cogs.search", "SearchCog"),
+    ("cogs.profile_ext", "ProfileExtCog"),
+    ("cogs.reminders", "RemindersCog"),
+    ("cogs.pingtrack", "PingTrackCog"),
+    ("cogs.meta", "MetaCog"),
     ("cogs.interactions", "InteractionsCog"),
     ("cogs.spoofer", "SpooferCog"),
     ("cogs.rpc_adapter", "RpcAdapterCog"),
@@ -1248,6 +1503,7 @@ async def _boot_cogs():
         cstate.decrypt_file = decrypt_file
         cstate._has_crypto = _HAS_CRYPTO
         cstate._HAS_CRYPTO = _HAS_CRYPTO
+        cstate._get_session = _get_session
 
         cstate.HOSTED_TOKENS = HOSTED_TOKENS
         cstate._host_sessions = _host_sessions
@@ -1291,6 +1547,7 @@ async def _boot_cogs():
         cstate._afk_msg = _afk_msg
         cstate._autodelete_secs = _autodelete_secs
         cstate._autoreact_emoji = _autoreact_emoji
+        cstate._superreact_emoji = _superreact_emoji
         cstate._multireact_pool = _multireact_pool
         cstate._multireact_enabled = _multireact_enabled
         cstate._giveaway_enabled = _giveaway_enabled
@@ -1305,11 +1562,20 @@ async def _boot_cogs():
         cstate.SNIPER_ENABLED = SNIPER_ENABLED
         cstate.LOGGER_ENABLED = LOGGER_ENABLED
         cstate._current_platform = _current_platform
+        cstate._latency_history = _latency_history
+        cstate._last_ready_ts = _last_ready_ts
 
-        # ── access control (shared by reference — cog mutations propagate) ──
         cstate.OWNER_ID           = OWNER_ID
-        cstate._admins            = _admins
-        cstate._devs              = _devs
+        if not hasattr(cstate, "_admins") or cstate._admins is None:
+            cstate._admins = _admins
+        else:
+            _admins.update(getattr(cstate, "_admins", set()) or set())
+            cstate._admins = _admins
+        if not hasattr(cstate, "_devs") or cstate._devs is None:
+            cstate._devs = _devs
+        else:
+            _devs.update(getattr(cstate, "_devs", set()) or set())
+            cstate._devs = _devs
         cstate.ADMIN_COMMANDS     = ADMIN_COMMANDS
         cstate.DEVELOPER_COMMANDS = DEVELOPER_COMMANDS
         cstate.OWNER_COMMANDS     = OWNER_COMMANDS
@@ -1363,6 +1629,22 @@ async def on_ready():
         _host_lock = asyncio.Lock()
     _last_ready_ts = time.time()
     _session_events.append({"ts": _last_ready_ts, "event": "ready", "user": str(client.user)})
+
+    try:
+        _get_session()
+        print("[wilt] shared aiohttp session warm")
+    except Exception as e:
+        print(f"[wilt] session init failed: {e}")
+
+    try:
+        gw = getattr(client, "_gateway", None)
+        ws = getattr(gw, "_ws", None) if gw else None
+        sock = getattr(ws, "_sock", None) or getattr(ws, "sock", None)
+        if sock is not None:
+            _tcp_nodelay(sock)
+            print("[wilt] TCP_NODELAY applied to gateway socket")
+    except Exception as e:
+        print(f"[wilt] tcp_nodelay skipped: {e}")
 
     is_main = True
     idx = "main"
@@ -1424,6 +1706,8 @@ async def on_ready():
         task_register("scheduler", _scheduler_loop())
     if not any("cache_cleanup" in str(t) for t in asyncio.all_tasks()):
         task_register("cache_cleanup", _cache_cleanup_loop())
+    if not any("heartbeat_probe" in str(t) for t in asyncio.all_tasks()):
+        task_register("heartbeat_probe", _heartbeat_probe_loop())
     if cfg.get("autoclaim_enabled") and not any("autoclaim" in str(t) for t in asyncio.all_tasks()):
         try:
             from cogs.quests import autoclaim_loop
@@ -1465,7 +1749,7 @@ async def on_resumed():
     _session_events.append({"ts": time.time(), "event": "resumed"})
 
 # ─────────────────────────────────────────────
-# DISPATCHER — pre-hooks + cog routing + help fallthrough
+# DISPATCHER
 # ─────────────────────────────────────────────
 
 async def _dispatch_message(_client, message):
@@ -1473,7 +1757,7 @@ async def _dispatch_message(_client, message):
 
     global PREFIX, _cfg
     global SNIPER_ENABLED, LOGGER_ENABLED, _afk_enabled, _afk_msg
-    global _autoreact_emoji, _autoaddback, _current_platform
+    global _autoreact_emoji, _superreact_emoji, _autoaddback, _current_platform
     global _autoclaim_enabled, _speak_lang
     global _giveaway_enabled, _nitrosniper_enabled
     global _vsniper_task
@@ -1488,8 +1772,19 @@ async def _dispatch_message(_client, message):
     global _server_prefixes, _cmd_blacklist_server, _cmd_blacklist_channel
     global _user_blacklist, _user_whitelist, _role_restrict, _cmd_disabled
     global _managed_tasks
+    global _latency_history
 
-    # ── PRE-HOOKS ──
+    # ── PRE-HOOKS (afk, filters, autoresponder, pingtrack) ──
+    try:
+        from cogs import state as cstate
+        hooks = list(getattr(cstate, "_pre_hooks", []) or [])
+        for _hook in hooks:
+            try:
+                await _hook(client, message)
+            except Exception as _he:
+                print(f"[pre-hook] {_he}")
+    except Exception as _he:
+        print(f"[pre-hook bootstrap] {_he}")
 
     if LOGGER_ENABLED and message.guild:
         try:
@@ -1547,6 +1842,7 @@ async def _dispatch_message(_client, message):
             "time": datetime.now().strftime("%H:%M:%S"),
             "content": message.content,
             "channel": getattr(message.channel, "name", str(message.channel.id)),
+            "ts": time.time(),
         })
         if len(_tracking[message.author.id]) > 200:
             _tracking[message.author.id] = _tracking[message.author.id][-200:]
@@ -1592,7 +1888,6 @@ async def _dispatch_message(_client, message):
         except Exception:
             pass
 
-    # ── AUTO-REACT (concurrent) ──
     if message.author.id == client.user.id and not message.content.startswith(PREFIX):
         try:
             react_tasks = []
@@ -1605,7 +1900,14 @@ async def _dispatch_message(_client, message):
         except Exception:
             pass
 
-    # ── COMMAND GATE ──
+    if (_superreact_emoji
+            and message.author.id == client.user.id
+            and message.content
+            and not message.content.startswith(PREFIX)):
+        try:
+            await message.add_reaction(_superreact_emoji)
+        except Exception:
+            pass
 
     if message.author.id != client.user.id:
         return
@@ -1632,10 +1934,17 @@ async def _dispatch_message(_client, message):
             return
         _cooldown_last[key] = time.time()
 
+    try:
+        lat = getattr(client, "latency", None)
+        if lat is not None:
+            _latency_history.append({"ts": time.time(), "ms": round(lat * 1000, 1)})
+            if len(_latency_history) > 500: del _latency_history[:-500]
+    except Exception:
+        pass
+
     if not _perm_check(cmd, message):
         return
 
-    # ── ACCESS GATE — tier enforcement ──
     if not _access_ok(message.author.id, cmd):
         lvl = _access_level(message.author.id)
         need = "owner"
@@ -1650,7 +1959,65 @@ async def _dispatch_message(_client, message):
 
     db_stats_inc(cmd)
 
-    # ── COG ROUTE ──
+    if cmd == "health":
+        cogs_n = len(_COG_INSTANCES)
+        live_tasks = sum(1 for t in asyncio.all_tasks() if not t.done())
+        gw = getattr(client, "_gateway", None)
+        gw_ok = bool(getattr(gw, "is_connected", False)) if gw else False
+        lat = getattr(client, "latency", 0) or 0
+        await message.edit(content=ui_box("health", [
+            f"  {DIM}user{S.RESET}      {client.user}",
+            f"  {DIM}gateway{S.RESET}   {'ok' if gw_ok else 'DOWN'}",
+            f"  {DIM}latency{S.RESET}   {round(lat*1000,1)}ms",
+            f"  {DIM}cogs{S.RESET}      {cogs_n}",
+            f"  {DIM}tasks{S.RESET}     {live_tasks}",
+            f"  {DIM}disconnects{S.RESET} {_reconnect_count}",
+            f"  {DIM}uptime{S.RESET}    {int(time.time() - _last_ready_ts)}s",
+        ]))
+        return
+
+    if cmd == "uptime":
+        up = int(time.time() - _last_ready_ts)
+        h, rem = divmod(up, 3600); m, s = divmod(rem, 60)
+        await message.edit(content=ui_box("uptime", [
+            f"  {DIM}up{S.RESET}          {h}h {m}m {s}s",
+            f"  {DIM}disconnects{S.RESET} {_reconnect_count}",
+            f"  {DIM}since ready{S.RESET} {datetime.fromtimestamp(_last_ready_ts).strftime('%Y-%m-%d %H:%M:%S')}",
+        ]))
+        return
+
+    if cmd == "latency":
+        sub = args[1].lower() if len(args) > 1 else ""
+        if sub == "history":
+            n = int(args[2]) if len(args) > 2 and args[2].isdigit() else 20
+            samples = _latency_history[-n:]
+            if not samples:
+                return await message.edit(content=ui_info("no samples yet"))
+            vals = [s["ms"] for s in samples]
+            avg = sum(vals) / len(vals)
+            lo, hi = min(vals), max(vals)
+            await message.edit(content=ui_box("latency history", [
+                f"  {DIM}samples{S.RESET}  {len(samples)}",
+                f"  {DIM}avg{S.RESET}      {avg:.1f}ms",
+                f"  {DIM}min{S.RESET}      {lo:.1f}ms",
+                f"  {DIM}max{S.RESET}      {hi:.1f}ms",
+                f"  {DIM}current{S.RESET}  {round(getattr(client, 'latency', 0)*1000, 1)}ms",
+            ]))
+            return
+        cur = round(getattr(client, "latency", 0) * 1000, 1)
+        return await message.edit(content=ui_ok(f"latency: {cur}ms"))
+
+    if cmd == "incidents":
+        rows = []
+        for e in _session_events[-40:]:
+            if e.get("event") in ("disconnect", "resumed", "ready"):
+                ts = datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
+                extra = f" #{e.get('count')}" if "count" in e else ""
+                rows.append(f"  {GREY}{ts}{RESET}  {e['event']}{extra}")
+        await message.edit(content=_paginate("incidents", "session events", rows)
+                           if rows else ui_info("none"))
+        return
+
     if cmd in _COG_REGISTRY:
         cog, _ = _COG_REGISTRY[cmd]
         try:
@@ -1664,7 +2031,6 @@ async def _dispatch_message(_client, message):
                 pass
         return
 
-    # ── INLINE FALLTHROUGH (help only) ──
     if cmd in ("help", "h"):
         try: await message.delete()
         except Exception: pass
@@ -1685,7 +2051,7 @@ async def on_message(message):
     await _dispatch_message(client, message)
 
 # ─────────────────────────────────────────────
-# OTHER EVENTS STILL OWNED INLINE
+# OTHER EVENTS
 # ─────────────────────────────────────────────
 
 @client.event
@@ -1693,11 +2059,40 @@ async def on_message_delete(message):
     if message.author.id == client.user.id: return
     cid = message.channel_id
     _snipe_cache.setdefault(cid, [])
+
+    try:
+        attachments = [a.get("url") for a in (message.attachments or [])]
+    except Exception:
+        attachments = []
+    try:
+        embeds = []
+        for e in (message.embeds or []):
+            if isinstance(e, dict):
+                embeds.append({k: e.get(k) for k in ("title", "description", "url", "type") if e.get(k)})
+            else:
+                d = {}
+                for k in ("title", "description", "url", "type"):
+                    v = getattr(e, k, None)
+                    if v: d[k] = v
+                if d: embeds.append(d)
+    except Exception:
+        embeds = []
+    try:
+        reactions = [str(r.emoji) for r in (message.reactions or [])]
+    except Exception:
+        reactions = []
+
     _snipe_cache[cid].append({
-        "author": str(message.author), "author_id": message.author.id,
+        "author": str(message.author),
+        "author_id": message.author.id,
         "content": message.content or "",
-        "attachments": [a.get("url") for a in (message.attachments or [])],
-        "time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(),
+        "attachments": attachments,
+        "embeds": embeds,
+        "reactions": reactions,
+        "message_id": message.id,
+        "channel_id": message.channel_id,
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "ts": time.time(),
     })
     if len(_snipe_cache[cid]) > SNIPE_LIMIT:
         _snipe_cache[cid] = _snipe_cache[cid][-SNIPE_LIMIT:]
@@ -1713,6 +2108,7 @@ async def on_message_edit(before, after):
     _editsnipe_cache[cid].append({
         "author": str(before.author), "author_id": before.author.id,
         "before": before.content or "", "after": after.content or "",
+        "message_id": before.id,
         "time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(),
     })
     if len(_editsnipe_cache[cid]) > SNIPE_LIMIT:
@@ -1749,9 +2145,9 @@ def _install_signal_handlers():
 
 _install_signal_handlers()
 
-print(f"[lunar] starting — prefix: '{PREFIX}' — v{VERSION}")
+print(f"[wilt] starting — prefix: '{PREFIX}' — v{VERSION}")
 try:
-    client.run()   # ← modifyself takes token at init, not at run()
+    client.run()
 except Exception as e:
     print(f"[FATAL] run failed: {type(e).__name__}: {e}")
     sys.exit(1)
