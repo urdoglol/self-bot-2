@@ -7,36 +7,34 @@ import modifyself_shim as discord
 from . import state as S
 
 
-# ─────────────────────────────────────────────────────────────
-# STATE SYNC
-# cogs/state.py handoff copies VALUES at boot, not references.
-# writes to S.<flag> alone leave __main__ (the real dispatcher) unchanged.
-# every write that must reach the dispatcher goes through _sync().
-# ─────────────────────────────────────────────────────────────
-
-_main = sys.modules.get("__main__")
-
-
 def _sync(**kw):
-    if _main is None:
+    main = sys.modules.get("__main__")
+    if main is None:
         return
     for k, v in kw.items():
         try:
-            setattr(_main, k, v)
+            setattr(main, k, v)
         except Exception:
             pass
 
 
-# ─────────────────────────────────────────────────────────────
-# RAW REACTION HELPER
-# shim's history-message .add_reaction() is broken — it drops the
-# positional `route` arg into HTTPClient.request() for reconstructed
-# messages. hit the endpoint directly instead; same result, no shim.
-# PUT /channels/{ch}/messages/{msg}/reactions/{emoji}/@me
-# ─────────────────────────────────────────────────────────────
+def _emoji_to_str(emoji):
+    if isinstance(emoji, str):
+        return emoji
+    name = getattr(emoji, "name", None)
+    eid = getattr(emoji, "id", None)
+    animated = getattr(emoji, "animated", False)
+    if name and eid:
+        prefix = "a" if animated else ""
+        return f"<{prefix}:{name}:{eid}>"
+    if name:
+        return str(name)
+    return str(emoji)
 
-async def _react(channel_id, message_id, emoji, session=None):
-    emoji_enc = urllib.parse.quote(emoji, safe="")
+
+async def _react_once(session, channel_id, message_id, emoji):
+    emoji_str = _emoji_to_str(emoji)
+    emoji_enc = urllib.parse.quote(emoji_str, safe="")
     url = (f"https://discord.com/api/v9/channels/{channel_id}"
            f"/messages/{message_id}/reactions/{emoji_enc}/@me")
     headers = {
@@ -44,17 +42,71 @@ async def _react(channel_id, message_id, emoji, session=None):
         "User-Agent": S.USER_AGENT,
         "Content-Length": "0",
     }
+    try:
+        async with session.put(url, headers=headers) as r:
+            if r.status == 429:
+                ra = 1.0
+                try:
+                    body = await r.json()
+                    ra = float(body.get("retry_after", 1.0))
+                except Exception:
+                    pass
+                return 429, ra
+            return r.status, None
+    except Exception as e:
+        return f"err:{e}", None
+
+
+async def _react(channel_id, message_id, emoji, session=None):
     own_session = session is None
     if own_session:
         session = aiohttp.ClientSession()
     try:
-        async with session.put(url, headers=headers) as r:
-            return r.status
-    except Exception as e:
-        return f"err:{e}"
+        for _ in range(4):
+            status, retry_after = await _react_once(
+                session, channel_id, message_id, emoji)
+            if status == 429:
+                await asyncio.sleep(max(retry_after or 1.0, 0.5))
+                continue
+            return status
+        return 429
     finally:
         if own_session:
             await session.close()
+
+
+def _install_react_patch():
+    try:
+        from modifyself.models.message import Message as _MSMessage
+    except ImportError as e:
+        print(f"[auto] cannot import Message for react patch: {e}")
+        return False
+
+    if getattr(_MSMessage, "_raw_react_patched", False):
+        return True
+
+    original = _MSMessage.add_reaction
+
+    async def patched_add_reaction(self, emoji, *args, **kwargs):
+        try:
+            return await original(self, emoji, *args, **kwargs)
+        except Exception as shim_err:
+            ch_id = getattr(self, "channel_id", None)
+            if ch_id is None:
+                ch = getattr(self, "channel", None)
+                ch_id = getattr(ch, "id", None) if ch is not None else None
+            msg_id = getattr(self, "id", None)
+            if ch_id is None or msg_id is None:
+                raise shim_err
+            status = await _react(ch_id, msg_id, emoji)
+            if isinstance(status, int) and status in (200, 204):
+                return None
+            raise shim_err
+
+    _MSMessage.add_reaction = patched_add_reaction
+    _MSMessage._raw_react_patched = True
+    print("[auto] Message.add_reaction patched (shim → raw REST fallback)")
+    return True
 
 
 async def _vsniper_loop():
@@ -81,7 +133,11 @@ async def _vsniper_loop():
 
 class AutoCog:
     COMMANDS = {"giveaway", "nitrosniper", "autoreact", "autoreactstop",
-                "multireact", "multiautoreact", "vsniper", "superreact"}
+                "multireact", "multiautoreact", "vsniper",
+                "superreact", "superreactstop", "reactdiag"}
+
+    def __init__(self):
+        _install_react_patch()
 
     async def handle(self, message, cmd, args):
         if cmd == "giveaway":
@@ -109,47 +165,48 @@ class AutoCog:
             await message.edit(content=S.ui_ok("stopped"))
 
         elif cmd == "superreact":
-            # superreact <emoji> [count] — react to the last N messages
             if len(args) < 2:
                 return await message.edit(
-                    content=S.ui_err("usage: superreact <emoji> [count]"))
-            emoji = args[1]
-            count = int(args[2]) if len(args) > 2 and args[2].isdigit() else 10
-            count = max(1, min(count, 50))
+                    content=S.ui_err("usage: superreact <emoji>  |  superreact stop"))
+            sub = args[1].lower()
+            if sub in ("stop", "off", "disable"):
+                S._superreact_emoji = None
+                _sync(_superreact_emoji=None)
+                return await message.edit(
+                    content=S.ui_ok("superreact → off"))
 
+            S._superreact_emoji = args[1]
+            _sync(_superreact_emoji=S._superreact_emoji)
+            await message.edit(content=S.ui_ok(
+                f"superreact → {S._superreact_emoji}  (reacting to your msgs)"))
+
+        elif cmd == "superreactstop":
+            S._superreact_emoji = None
+            _sync(_superreact_emoji=None)
+            await message.edit(content=S.ui_ok("superreact → off"))
+
+        elif cmd == "reactdiag":
             try:
-                targets = []
-                async for m in message.channel.history(limit=count + 5):
-                    if m.id == message.id:
-                        continue
-                    targets.append(m.id)
-                    if len(targets) >= count:
-                        break
-
-                if not targets:
-                    return await message.edit(content=S.ui_info("nothing to react to"))
-
-                ch_id = message.channel.id
-                async with aiohttp.ClientSession() as session:
-                    results = await asyncio.gather(*(
-                        _react(ch_id, mid, emoji, session=session)
-                        for mid in targets
-                    ), return_exceptions=True)
-
-                ok = sum(1 for r in results if r in (200, 204))
-                fails = len(targets) - ok
-
-                if ok == 0:
-                    sample = next((r for r in results if isinstance(r, (int, str))), "?")
-                    return await message.edit(content=S.ui_err(
-                        f"superreact: all {len(targets)} failed (last={sample})"))
-
-                msg = f"superreact → {emoji} × {ok}/{len(targets)} msgs"
-                if fails:
-                    msg += f"  ({fails} failed)"
-                await message.edit(content=S.ui_ok(msg))
-            except Exception as e:
-                await message.edit(content=S.ui_err(f"superreact: {e}"))
+                from modifyself.models.message import Message as _MSMessage
+                patched = bool(getattr(_MSMessage, "_raw_react_patched", False))
+            except ImportError:
+                patched = "import-failed"
+            main = sys.modules.get("__main__")
+            main_ar = getattr(main, "_autoreact_emoji", None) if main else None
+            main_sr = getattr(main, "_superreact_emoji", None) if main else None
+            main_multi = getattr(main, "_multireact_enabled", None) if main else None
+            lines = [
+                f"  patch installed:     {patched}",
+                f"  S._autoreact_emoji:  {S._autoreact_emoji!r}",
+                f"  main._autoreact:     {main_ar!r}",
+                f"  S._superreact_emoji: {S._superreact_emoji!r}",
+                f"  main._superreact:    {main_sr!r}",
+                f"  S._multireact_en:    {S._multireact_enabled}",
+                f"  main._multireact:    {main_multi}",
+                f"  pool (S):            {S._multireact_pool}",
+                f"  __main__ present:    {main is not None}",
+            ]
+            await message.edit(content=S._ansi_block(lines))
 
         elif cmd in ("multireact", "multiautoreact"):
             sub = args[1].lower() if len(args) > 1 else ""
