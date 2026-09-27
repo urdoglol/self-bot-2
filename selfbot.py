@@ -168,7 +168,7 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
               "Electron/28.2.10 Safari/537.36")
 
 # ─────────────────────────────────────────────
-# LATENCY TUNING — global aiohttp session
+# LATENCY TUNING
 # ─────────────────────────────────────────────
 
 _LATENCY_HEADERS = {
@@ -388,8 +388,8 @@ HELP_DATA = {
         ("spam <n> <text>","blast n messages fast"),("spamstop","kill active spam loop"),
         ("purge [n]","delete your last n messages"),("clear","delete command message"),
         ("copycat <id>","mirror next 10 msgs from user"),("status <text>","set custom status"),
-        ("status clear","clear status"),("platform <type>","spoof gateway platform"),
-        ("platform off","reset platform to desktop"),("hypesquad <house>","set hypesquad house"),
+        ("status clear","clear status"),
+        ("hypesquad <house>","set hypesquad house"),
         ("hypesquad off","remove hypesquad badge"),
     ],
     "quests": [
@@ -397,7 +397,8 @@ HELP_DATA = {
         ("questall","solve all quests at once"),("autoquest on/off","auto-run quests on startup"),
         ("autoclaim on/off","auto-claim completed quests"),("autoclaim run","sweep and claim now"),
         ("orbbadge","claim orb badge"),("questdump [idx]","dump raw quest config"),
-        ("questdiag","show quest diagnostics"),
+        ("questdiag","show quest diagnostics"),("qtransport","show transport mode"),
+        ("spdecode <base64>","decode a captured x-super-properties header"),
     ],
     "sniper": [
         ("sniper on/off","toggle nitro gift sniper"),
@@ -551,6 +552,9 @@ HELP_DATA = {
         ("vckick <user_id>","kick user from vc"),("vcmove <user> <ch_id>","move user to channel"),
         ("vcmoveall <ch1> <ch2>","move all users ch1 → ch2"),
         ("vcreconnect on/off/status","auto-rejoin vc on disconnect"),
+        ("vckeep on [ch_id]","24/7 presence — auto-rejoin every 15s"),
+        ("vckeep off","stop the 24/7 keep loop"),
+        ("vckeep status","show active keep loops"),
         ("selfmute","toggle your own server mute"),
         ("selfdeaf","toggle your own server deafen"),
         ("selfstream","toggle your stream (go live)"),
@@ -849,6 +853,11 @@ HELP_DATA = {
         ("spoof remove <platform>","drop a platform from the pool"),
         ("spoof pool","show the pool, arrow marks next in rotate order"),
         ("spoof mode <mode>","rotate | random | sticky — how the pool cycles"),
+        ("spoof rotate start [secs]","auto-reconnect timer cycles the pool"),
+        ("spoof rotate stop","stop the rotation timer"),
+        ("spoof rotate interval <s>","set tick interval"),
+        ("spoof rotate status","show rotation state"),
+        ("spoof next","force reconnect to consume next preset"),
         ("spoof clear","empty the pool — no rewrite on next IDENTIFY"),
         ("spoof status","show spoofer state (mode, pool, cursor, last pick)"),
         ("spoof reset","reset to desktop, sticky mode"),
@@ -857,6 +866,13 @@ HELP_DATA = {
         ("vr","spoof as VR headset (sticky)"),
         ("console","spoof as console (sticky)"),
         ("spooferdiag","spoofer diagnostics dump"),
+    ],
+    "multispoof": [
+        ("multispoof start [names...]","default: mobile ios vr console"),
+        ("multispoof stop [names...]","stop all or named satellites"),
+        ("multispoof status","live session table"),
+        ("multispoof restart","cycle every satellite"),
+        ("multispoof list","show available satellite presets"),
     ],
     "profile": [
         ("setpfp <url>","set profile picture from url"),("setbio <text>","set profile bio"),
@@ -993,7 +1009,7 @@ def build_help_root(page=1):
         "reminders":"reminders, timers, webhook notifications",
         "pingtrack":"ping counters + mention log",
         "meta":"config I/O, debug, status watch, uptime, github watch",
-        "ar":"auto-responder","voice":"voice channel controls",
+        "ar":"auto-responder","voice":"voice channel controls + 24/7 vckeep",
         "roles":"role introspection & colour",
         "rpc":"rich presence — 6 slots, spotify, xbox, ps, vrchat, meta",
         "fun":"fun & roleplay","tools":"tools & generators","host":"multi-account hosting",
@@ -1008,7 +1024,8 @@ def build_help_root(page=1):
         "utility":"text, afk, translate","tracking":"message & profile tracking",
         "downloads":"media downloader","social":"friends & social",
         "auto":"automation, snipers, superreact",
-        "spoofer":"platform / device spoofing",
+        "spoofer":"platform / device spoofing — pool + rotation",
+        "multispoof":"concurrent sessions — 4+ device badges at once",
         "profile":"account profile","status":"custom status",
         "mass":"mass action tools","nuke":"destructive ops + backup","scrape":"scrape & export",
         "webhooks":"webhooks & emoji tools","automod":"automod, raid, quarantine, tickets, verify",
@@ -1466,6 +1483,7 @@ COG_MODULES = [
     ("cogs.meta", "MetaCog"),
     ("cogs.interactions", "InteractionsCog"),
     ("cogs.spoofer", "SpooferCog"),
+    ("cogs.multispoof", "MultiSpoofCog"),
     ("cogs.rpc_adapter", "RpcAdapterCog"),
 ]
 
@@ -1741,6 +1759,11 @@ async def on_disconnect():
     global _reconnect_count
     _reconnect_count += 1
     _session_events.append({"ts": time.time(), "event": "disconnect", "count": _reconnect_count})
+    try:
+        from cogs import state as cstate
+        await cstate.satellite_stop_all()
+    except Exception as e:
+        print(f"[ws] satellite shutdown error: {e}")
     if _auto_reconnect:
         print(f"[ws] disconnected — auto-reconnect attempt #{_reconnect_count}")
 
@@ -1774,7 +1797,6 @@ async def _dispatch_message(_client, message):
     global _managed_tasks
     global _latency_history
 
-    # ── PRE-HOOKS (afk, filters, autoresponder, pingtrack) ──
     try:
         from cogs import state as cstate
         hooks = list(getattr(cstate, "_pre_hooks", []) or [])
@@ -1889,25 +1911,48 @@ async def _dispatch_message(_client, message):
             pass
 
     if message.author.id == client.user.id and not message.content.startswith(PREFIX):
+        # Read from __main__ so cog _sync() writes are visible here
+        _main = sys.modules.get("__main__")
+        _ar   = getattr(_main, "_autoreact_emoji",   None) or _autoreact_emoji
+        _sr   = getattr(_main, "_superreact_emoji",  None) or _superreact_emoji
+        _me   = getattr(_main, "_multireact_enabled", False) or _multireact_enabled
+        _mp   = getattr(_main, "_multireact_pool",   None) or _multireact_pool
+
+        _ch_id  = getattr(message, "channel_id", None)
+        if _ch_id is None:
+            _ch = getattr(message, "channel", None)
+            _ch_id = getattr(_ch, "id", None) if _ch else None
+        _msg_id = getattr(message, "id", None)
+
+        # Pull _react from the auto cog if loaded, else fall back to add_reaction
+        _react_fn = None
         try:
-            react_tasks = []
-            if _autoreact_emoji:
-                react_tasks.append(message.add_reaction(_autoreact_emoji))
-            if _multireact_enabled and _multireact_pool:
-                react_tasks.extend(message.add_reaction(e) for e in _multireact_pool)
-            if react_tasks:
-                await asyncio.gather(*react_tasks, return_exceptions=True)
+            from cogs import auto as _auto_mod
+            _react_fn = getattr(_auto_mod, "_react", None)
         except Exception:
             pass
 
-    if (_superreact_emoji
-            and message.author.id == client.user.id
-            and message.content
-            and not message.content.startswith(PREFIX)):
-        try:
-            await message.add_reaction(_superreact_emoji)
-        except Exception:
-            pass
+        async def _do_react(emoji):
+            if _react_fn and _ch_id and _msg_id:
+                await _react_fn(_ch_id, _msg_id, emoji)
+            else:
+                try:
+                    await message.add_reaction(emoji)
+                except Exception:
+                    pass
+
+        if _ar:
+            asyncio.create_task(_do_react(_ar))
+
+        if _me and _mp:
+            async def _multi_react():
+                for _e in list(_mp):
+                    await _do_react(_e)
+                    await asyncio.sleep(0.3)
+            asyncio.create_task(_multi_react())
+
+        if _sr:
+            asyncio.create_task(_do_react(_sr))
 
     if message.author.id != client.user.id:
         return
@@ -1966,13 +2011,13 @@ async def _dispatch_message(_client, message):
         gw_ok = bool(getattr(gw, "is_connected", False)) if gw else False
         lat = getattr(client, "latency", 0) or 0
         await message.edit(content=ui_box("health", [
-            f"  {DIM}user{S.RESET}      {client.user}",
-            f"  {DIM}gateway{S.RESET}   {'ok' if gw_ok else 'DOWN'}",
-            f"  {DIM}latency{S.RESET}   {round(lat*1000,1)}ms",
-            f"  {DIM}cogs{S.RESET}      {cogs_n}",
-            f"  {DIM}tasks{S.RESET}     {live_tasks}",
-            f"  {DIM}disconnects{S.RESET} {_reconnect_count}",
-            f"  {DIM}uptime{S.RESET}    {int(time.time() - _last_ready_ts)}s",
+            f"  {DIM}user{RESET}      {client.user}",
+            f"  {DIM}gateway{RESET}   {'ok' if gw_ok else 'DOWN'}",
+            f"  {DIM}latency{RESET}   {round(lat*1000,1)}ms",
+            f"  {DIM}cogs{RESET}      {cogs_n}",
+            f"  {DIM}tasks{RESET}     {live_tasks}",
+            f"  {DIM}disconnects{RESET} {_reconnect_count}",
+            f"  {DIM}uptime{RESET}    {int(time.time() - _last_ready_ts)}s",
         ]))
         return
 
@@ -1980,9 +2025,9 @@ async def _dispatch_message(_client, message):
         up = int(time.time() - _last_ready_ts)
         h, rem = divmod(up, 3600); m, s = divmod(rem, 60)
         await message.edit(content=ui_box("uptime", [
-            f"  {DIM}up{S.RESET}          {h}h {m}m {s}s",
-            f"  {DIM}disconnects{S.RESET} {_reconnect_count}",
-            f"  {DIM}since ready{S.RESET} {datetime.fromtimestamp(_last_ready_ts).strftime('%Y-%m-%d %H:%M:%S')}",
+            f"  {DIM}up{RESET}          {h}h {m}m {s}s",
+            f"  {DIM}disconnects{RESET} {_reconnect_count}",
+            f"  {DIM}since ready{RESET} {datetime.fromtimestamp(_last_ready_ts).strftime('%Y-%m-%d %H:%M:%S')}",
         ]))
         return
 
@@ -1997,11 +2042,11 @@ async def _dispatch_message(_client, message):
             avg = sum(vals) / len(vals)
             lo, hi = min(vals), max(vals)
             await message.edit(content=ui_box("latency history", [
-                f"  {DIM}samples{S.RESET}  {len(samples)}",
-                f"  {DIM}avg{S.RESET}      {avg:.1f}ms",
-                f"  {DIM}min{S.RESET}      {lo:.1f}ms",
-                f"  {DIM}max{S.RESET}      {hi:.1f}ms",
-                f"  {DIM}current{S.RESET}  {round(getattr(client, 'latency', 0)*1000, 1)}ms",
+                f"  {DIM}samples{RESET}  {len(samples)}",
+                f"  {DIM}avg{RESET}      {avg:.1f}ms",
+                f"  {DIM}min{RESET}      {lo:.1f}ms",
+                f"  {DIM}max{RESET}      {hi:.1f}ms",
+                f"  {DIM}current{RESET}  {round(getattr(client, 'latency', 0)*1000, 1)}ms",
             ]))
             return
         cur = round(getattr(client, "latency", 0) * 1000, 1)
@@ -2056,17 +2101,49 @@ async def on_message(message):
 
 @client.event
 async def on_message_delete(message):
-    if message.author.id == client.user.id: return
-    cid = message.channel_id
+    # modifyself shim sometimes delivers this as a raw dict
+    try:
+        author = message.author
+    except AttributeError:
+        author = None
+
+    if author is None and isinstance(message, dict):
+        author_id = (message.get("author") or {}).get("id") if isinstance(message.get("author"), dict) else None
+        if author_id is None:
+            return
+        if author_id == client.user.id:
+            return
+        cid = message.get("channel_id")
+        content = message.get("content") or ""
+        attachments_raw = message.get("attachments") or []
+        embeds_raw = message.get("embeds") or []
+        reactions_raw = message.get("reactions") or []
+        msg_id = message.get("id")
+        author_str = (message.get("author") or {}).get("username", "?") if isinstance(message.get("author"), dict) else "?"
+    else:
+        if author.id == client.user.id:
+            return
+        cid = message.channel_id
+        content = message.content or ""
+        attachments_raw = message.attachments or []
+        embeds_raw = message.embeds or []
+        reactions_raw = message.reactions or []
+        msg_id = message.id
+        author_str = str(author)
+        author_id = author.id
+
     _snipe_cache.setdefault(cid, [])
 
     try:
-        attachments = [a.get("url") for a in (message.attachments or [])]
+        attachments = [a.get("url") if isinstance(a, dict) else getattr(a, "url", None)
+                       for a in attachments_raw]
+        attachments = [a for a in attachments if a]
     except Exception:
         attachments = []
+
     try:
         embeds = []
-        for e in (message.embeds or []):
+        for e in embeds_raw:
             if isinstance(e, dict):
                 embeds.append({k: e.get(k) for k in ("title", "description", "url", "type") if e.get(k)})
             else:
@@ -2077,44 +2154,53 @@ async def on_message_delete(message):
                 if d: embeds.append(d)
     except Exception:
         embeds = []
+
     try:
-        reactions = [str(r.emoji) for r in (message.reactions or [])]
+        reactions = [str(r) if not isinstance(r, dict) else str(r.get("emoji", "?"))
+                     for r in reactions_raw]
     except Exception:
         reactions = []
 
     _snipe_cache[cid].append({
-        "author": str(message.author),
-        "author_id": message.author.id,
-        "content": message.content or "",
+        "author": author_str,
+        "author_id": author_id,
+        "content": content,
         "attachments": attachments,
         "embeds": embeds,
         "reactions": reactions,
-        "message_id": message.id,
-        "channel_id": message.channel_id,
+        "message_id": msg_id,
+        "channel_id": cid,
         "time": datetime.now().strftime("%H:%M:%S"),
         "ts": time.time(),
     })
     if len(_snipe_cache[cid]) > SNIPE_LIMIT:
         _snipe_cache[cid] = _snipe_cache[cid][-SNIPE_LIMIT:]
     if LOGGER_ENABLED:
-        log_msg("DEL", f"{message.author}: {message.content[:100]}")
+        log_msg("DEL", f"{author_str}: {content[:100]}")
 
 @client.event
 async def on_message_edit(before, after):
-    if before.author.id == client.user.id: return
-    if before.content == after.content: return
-    cid = before.channel_id
-    _editsnipe_cache.setdefault(cid, [])
-    _editsnipe_cache[cid].append({
-        "author": str(before.author), "author_id": before.author.id,
-        "before": before.content or "", "after": after.content or "",
-        "message_id": before.id,
+    try:
+        before_author_id = before.author.id
+        before_cid = before.channel_id
+        before_content = before.content or ""
+        after_content = after.content or ""
+        msg_id = before.id
+    except AttributeError:
+        return
+    if before_author_id == client.user.id: return
+    if before_content == after_content: return
+    _editsnipe_cache.setdefault(before_cid, [])
+    _editsnipe_cache[before_cid].append({
+        "author": str(before.author), "author_id": before_author_id,
+        "before": before_content, "after": after_content,
+        "message_id": msg_id,
         "time": datetime.now().strftime("%H:%M:%S"), "ts": time.time(),
     })
-    if len(_editsnipe_cache[cid]) > SNIPE_LIMIT:
-        _editsnipe_cache[cid] = _editsnipe_cache[cid][-SNIPE_LIMIT:]
+    if len(_editsnipe_cache[before_cid]) > SNIPE_LIMIT:
+        _editsnipe_cache[before_cid] = _editsnipe_cache[before_cid][-SNIPE_LIMIT:]
     if LOGGER_ENABLED:
-        log_msg("EDIT", f"{before.author}: '{before.content[:60]}' → '{after.content[:60]}'")
+        log_msg("EDIT", f"{before.author}: '{before_content[:60]}' → '{after_content[:60]}'")
 
 @client.event
 async def on_member_update(before, after):
