@@ -33,6 +33,7 @@ from . import state as S
 # ---------------------------------------------------------------------------
 _RE_CUSTOM    = re.compile(r"<(a?):([A-Za-z0-9_]+):(\d+)>")
 _RE_SHORTCODE = re.compile(r":([A-Za-z0-9_]+):")
+_RE_MENTION   = re.compile(r"<@!?\d+>")          # user mention — never an emoji
 _RE_NITRO     = re.compile(r"discord\.gift/([A-Za-z0-9]+)")
 _RE_GIVEAWAY  = re.compile(r"🎉|giveaway", re.IGNORECASE)
 
@@ -75,20 +76,51 @@ def _emoji_url_part(emoji_str: str) -> str:
     return urllib.parse.quote(emoji_str, safe="")
 
 
-def _parse_emoji_arg(args: list, start: int = 1) -> str:
+def _parse_emoji_arg(args: list, start: int = 1, raw_content: str = "") -> str:
     """
-    Re-join args[start:] and extract the first emoji token.
-    Fixes the split-token bug where <:name:id> becomes ["<:name", "id>"].
+    Extract the emoji from a command invocation.
+
+    The shim splits message content on whitespace, which breaks custom emoji
+    tokens like <:skull:123456> into ["<:skull", "123456>"].  Worse, on some
+    mobile builds the shim renders the emoji as a user-mention-shaped token
+    <@122556...> — a number-only ID with no colon, which is NEVER a valid emoji.
+
+    Strategy:
+      1. Try the raw message content first (most reliable — contains original text)
+      2. Re-join args and regex-search that
+      3. Reject anything that looks like a user/role mention
+      4. Fall back to first token only if it's not a mention
     """
-    raw = " ".join(args[start:]).strip()
-    m = _RE_CUSTOM.search(raw)
+    # 1. Try to extract from the original message content (passed as raw_content)
+    #    Skip past the command word and look for the first emoji after it
+    if raw_content:
+        # Strip prefix + command word, search remainder
+        parts = raw_content.split(None, start)   # split off `start` tokens
+        remainder = parts[-1] if len(parts) > start else ""
+        m = _RE_CUSTOM.search(remainder)
+        if m:
+            return m.group(0)
+        m = _RE_SHORTCODE.search(remainder)
+        if m:
+            return m.group(0)
+
+    # 2. Re-join args (catches split tokens like ["<:skull", "123456>"])
+    joined = " ".join(args[start:]).strip()
+    m = _RE_CUSTOM.search(joined)
     if m:
         return m.group(0)
-    m = _RE_SHORTCODE.search(raw)
+    m = _RE_SHORTCODE.search(joined)
     if m:
         return m.group(0)
-    parts = raw.split()
-    return parts[0] if parts else raw
+
+    # 3. Reject user/role mentions — shim bug on mobile turns emoji into <@id>
+    first = joined.split()[0] if joined.split() else joined
+    if _RE_MENTION.match(first.strip()):
+        # It's a mention, not an emoji — return empty so caller can error
+        return ""
+
+    # 4. Whatever's left — unicode emoji or plain text
+    return first
 
 
 def _resolve_emoji(client, raw: str) -> str:
@@ -353,8 +385,11 @@ class AutoCog:
             if len(args) < 2:
                 return await message.edit(
                     content=S.ui_err("usage: autoreact <emoji>"))
-            # Re-join in case emoji was split: .autoreact <:name:id> → args=["<:name","id>"]
-            raw   = _parse_emoji_arg(args, 1)
+            raw_content = getattr(message, "content", "") or ""
+            raw   = _parse_emoji_arg(args, 1, raw_content=raw_content)
+            if not raw:
+                return await message.edit(
+                    content=S.ui_err("couldn't read emoji — paste it directly after the command"))
             emoji = self._resolve(raw)
             S._autoreact_emoji = emoji
             _sync(_autoreact_emoji=emoji)
@@ -374,7 +409,11 @@ class AutoCog:
                 S._superreact_emoji = None
                 _sync(_superreact_emoji=None)
                 return await message.edit(content=S.ui_ok("superreact → off"))
-            raw   = _parse_emoji_arg(args, 1)
+            raw_content = getattr(message, "content", "") or ""
+            raw   = _parse_emoji_arg(args, 1, raw_content=raw_content)
+            if not raw:
+                return await message.edit(
+                    content=S.ui_err("couldn't read emoji — paste it directly after the command"))
             emoji = self._resolve(raw)
             S._superreact_emoji = emoji
             _sync(_superreact_emoji=emoji)
@@ -411,8 +450,13 @@ class AutoCog:
         elif cmd in ("multireact", "multiautoreact"):
             sub = args[1].lower() if len(args) > 1 else ""
 
+            raw_content = getattr(message, "content", "") or ""
+
             if sub == "add" and len(args) >= 3:
-                raw   = _parse_emoji_arg(args, 2)
+                raw   = _parse_emoji_arg(args, 2, raw_content=raw_content)
+                if not raw:
+                    return await message.edit(
+                        content=S.ui_err("couldn't read emoji — paste it directly after 'add'"))
                 emoji = self._resolve(raw)
                 if emoji in S._multireact_pool:
                     return await message.edit(content=S.ui_info("already in pool"))
@@ -421,7 +465,7 @@ class AutoCog:
                     f"added {emoji} ({len(S._multireact_pool)} in pool)"))
 
             elif sub in ("remove", "rem", "del") and len(args) >= 3:
-                raw   = _parse_emoji_arg(args, 2)
+                raw   = _parse_emoji_arg(args, 2, raw_content=raw_content)
                 emoji = self._resolve(raw)
                 if emoji not in S._multireact_pool:
                     return await message.edit(content=S.ui_err("not in pool"))
