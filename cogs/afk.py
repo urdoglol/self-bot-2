@@ -1,10 +1,14 @@
 # cogs/afk.py | full AFK system — whitelist, blacklist, cooldown, dm-only,
 # per-server, expiry, emergency
 #
-# fixes vs prior version:
-#   - reply-to-us now counts as a ping (reference / message_reference walk)
-#   - all id comparisons normalized through _as_int (str/int mismatch gone)
+# behavior:
+#   - ignore list fires on ANY address path (direct @, reply-to-us, raw
+#     mention list, mention_everyone). anything that reaches "addressed to me"
+#     is checked against the blacklist.
+#   - direct @ping, reply-to-us, raw mention, and mention_everyone all
+#     count as addressed — that's the trigger surface for the hook.
 #   - blocked users filtered via relationship type 2
+#   - all id comparisons normalized through _as_int
 #   - self-message guard hardened
 #   - per-call debug line (toggle DEBUG_AFK = True to trace)
 
@@ -45,23 +49,29 @@ def _my_id(client):
 
 
 def _mentions_me(client, message):
-    """True if pinged directly OR via a reply to one of our messages."""
+    """
+    True if the message addresses us by ANY path:
+      - direct @ in message.mentions
+      - reply to one of our messages (reference / message_reference)
+      - raw mention list (raw_mentions / mentioned_users)
+      - @everyone / @here (mentions_everyone)
+    This is the gate the ignore list runs against — anything that lands
+    here is checked against the blacklist.
+    """
     my_id = _my_id(client)
     if my_id is None:
         return False
 
-    # direct mention — normalize both sides
+    # 1) direct mention
     for u in (getattr(message, "mentions", None) or []):
         if _as_int(getattr(u, "id", None)) == my_id:
             return True
 
-    # reply-to-us — walk reference / message_reference through every shape
+    # 2) reply-to-us
     for attr in ("reference", "message_reference"):
         ref = getattr(message, attr, None)
         if ref is None:
             continue
-
-        # resolved author id paths (varies by fork)
         resolved = getattr(ref, "resolved", None)
         candidates = [
             getattr(ref, "author_id", None),
@@ -72,13 +82,12 @@ def _mentions_me(client, message):
         for c in candidates:
             if _as_int(c) == my_id:
                 return True
-
-        # some forks store a mention list on the reference itself
+        # some forks stuff the ping list onto the reference itself
         for u in (getattr(ref, "mentions", None) or []):
             if _as_int(getattr(u, "id", None)) == my_id:
                 return True
 
-    # raw mentions fallback
+    # 3) raw mention fallback
     for attr in ("mentioned_users", "raw_mentions"):
         v = getattr(message, attr, None)
         if v is None:
@@ -90,7 +99,7 @@ def _mentions_me(client, message):
         except TypeError:
             continue
 
-    # everyone ping — treat as addressed to us
+    # 4) @everyone / @here
     if getattr(message, "mentions_everyone", False):
         return True
 
@@ -163,11 +172,11 @@ async def _afk_pre_hook(client, message):
     if author_id is None or author_id == my_id:
         return
 
-    # must be addressed to us (direct ping OR reply-to-us)
+    # addressed by any path — direct @, reply, raw mention, @everyone
     if not _mentions_me(client, message):
         return
 
-    # ignore list — normalized int comparison
+    # ignore list — fires regardless of HOW the author reached us
     if author_id in a["blacklist"]:
         return
 
