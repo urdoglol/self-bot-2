@@ -1,11 +1,12 @@
 # modifyself_shim.py | discord-shaped namespace over modifyself.
-# v6 — patches:
-#   - reconnect_gateway closes the raw ws with code 4000 and clears
-#     _closed_event so modifyself's own _handle_disconnect → _reconnect
-#     chain drives the reconnect. never awaits gw.connect() (which blocks).
-#   - _upgrade returns tuples for multi-arg events (reactions, voice
-#     state, member updates) so handlers receive proper arg positions.
-#   - wrapper unpacks tuples cleanly.
+# v7 — patches on top of v6:
+#   - _upgrade scrubs reply-reference-injected mentions out of .mentions
+#     on MESSAGE_CREATE / MESSAGE_UPDATE. Discord stuffs the replied-to
+#     author into that list on a reply-quote, which makes a reply look
+#     like a direct @ping. now only explicit <@id> tokens in content
+#     survive. reply detection still works via .reference.
+#   - v6 retained: reconnect_gateway 4000-close, tuple-unpacking for
+#     multi-arg events, wrapper handles both shapes.
 import asyncio
 import inspect
 import json as _json
@@ -268,11 +269,10 @@ InvalidToken     = DiscordException
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  EVENT STUBS — for payloads that have no model class
+#  EVENT STUBS
 # ═══════════════════════════════════════════════════════════════════
 
 class _StubUser:
-    """Minimal user object for reaction / typing payloads."""
     def __init__(self, data):
         self.id = int(data.get("id", 0))
         self.name = data.get("username", "")
@@ -284,7 +284,6 @@ class _StubUser:
 
 
 class _StubReaction:
-    """Minimal reaction object."""
     def __init__(self, emoji, message, count=1, user_id=None):
         self.emoji = emoji
         self.message = message
@@ -294,7 +293,6 @@ class _StubReaction:
 
 
 class _VoiceStateStub:
-    """Voice state — used for before/after in on_voice_state_update."""
     def __init__(self, payload, guild_id, user_id):
         self.id = user_id
         self.guild_id = guild_id
@@ -307,7 +305,6 @@ class _VoiceStateStub:
         self.self_deaf = payload.get("self_deaf", False)
         self.self_stream = payload.get("self_stream", False)
         self.self_video = payload.get("self_video", False)
-        # resolve channel lazily via state
         self._state = None
         self._guild = None
     @property
@@ -326,6 +323,46 @@ class _VoiceStateStub:
 #  EVENT PAYLOAD UPGRADE
 # ═══════════════════════════════════════════════════════════════════
 
+def _explicit_mention_ids(content):
+    """Extract <@123> / <@!123> ids from message content."""
+    ids = set()
+    if not content:
+        return ids
+    i = 0
+    while True:
+        j = content.find("<@", i)
+        if j < 0:
+            break
+        k = content.find(">", j)
+        if k < 0:
+            break
+        tok = content[j + 2:k].lstrip("!")
+        if tok.isdigit():
+            ids.add(int(tok))
+        i = k + 1
+    return ids
+
+
+def _scrub_mentions(payload):
+    """
+    Remove reply-reference-injected authors from payload['mentions'].
+    Discord adds the replied-to author to that list on a reply-quote,
+    which makes a reply look like a direct @ping. keep only ids that
+    are explicitly present as <@id> tokens in content.
+    """
+    try:
+        content = payload.get("content", "") or ""
+        explicit = _explicit_mention_ids(content)
+        raw = payload.get("mentions") or []
+        payload["mentions"] = [
+            m for m in raw
+            if str(m.get("id", "")) in {str(i) for i in explicit}
+        ]
+    except Exception as e:
+        logger.debug(f"[shim] mention scrub failed: {e}")
+    return payload
+
+
 def _upgrade(state, event_name, payload):
     """
     Upgrade a raw dict payload for the named event.
@@ -336,16 +373,15 @@ def _upgrade(state, event_name, payload):
 
     try:
         if event_name in ("MESSAGE_CREATE", "MESSAGE_UPDATE"):
+            payload = _scrub_mentions(payload)
             return state._store_message(payload)
 
         if event_name in ("MESSAGE_REACTION_ADD", "MESSAGE_REACTION_REMOVE"):
-            # user
             user_data = payload.get("member", {}).get("user") if payload.get("member") else payload.get("user")
             if not user_data:
                 user_data = {"id": str(payload.get("user_id", "0"))}
             user_obj = _StubUser(user_data)
 
-            # message
             msg_id = int(payload.get("message_id", 0))
             msg = state._messages.get(msg_id)
             if msg is None:
@@ -403,6 +439,34 @@ def _upgrade(state, event_name, payload):
 
         if event_name == "INTERACTION_CREATE":
             return payload
+
+        # delete paths — return real Message objects so handlers don't
+        # crash touching .author on a raw dict
+        if event_name == "MESSAGE_DELETE":
+            msg_id = int(payload.get("id", 0))
+            cached = state._messages.get(msg_id)
+            if cached is not None:
+                return cached
+            ch_id = int(payload.get("channel_id", 0))
+            stub_data = {
+                "id": str(msg_id),
+                "channel_id": str(ch_id),
+                "author": {"id": "0", "username": "unknown", "discriminator": "0"},
+                "content": "",
+                "timestamp": "1970-01-01T00:00:00+00:00",
+            }
+            return _MSMessage(state=state, data=stub_data)
+
+        if event_name == "MESSAGE_DELETE_BULK":
+            out = []
+            for mid in (payload.get("ids") or []):
+                try:
+                    m = state._messages.get(int(mid))
+                except (TypeError, ValueError):
+                    m = None
+                if m is not None:
+                    out.append(m)
+            return out
     except Exception as e:
         logger.debug(f"[shim] _upgrade {event_name} failed: {e}")
     return payload
@@ -1000,8 +1064,6 @@ class Client(_MSClient):
         self._presence_status = "online"
         self._closed_flag = False
 
-    # ── reconnect lock + driver ──
-
     _reconnect_lock = None
 
     def _get_reconnect_lock(self):
@@ -1010,16 +1072,6 @@ class Client(_MSClient):
         return Client._reconnect_lock
 
     async def reconnect_gateway(self):
-        """
-        Force a fresh IDENTIFY.
-
-        Approach: close the RAW websocket with a RESUME code (4000), and
-        make sure `_closed_event` is clear so modifyself's own
-        `_handle_disconnect` → `_reconnect` chain drives the reconnect
-        in its own task. Do NOT call `gw.close()` (it sets `_closed_event`
-        and suppresses auto-reconnect) and do NOT `await gw.connect()` (it
-        blocks on the message loop and never returns).
-        """
         gw = getattr(self, "_gateway", None)
         if gw is None:
             logger.debug("[shim] reconnect_gateway: no gateway")
@@ -1027,16 +1079,13 @@ class Client(_MSClient):
 
         lock = self._get_reconnect_lock()
         async with lock:
-            # clear session state so the fresh IDENTIFY fires (not RESUME)
             for attr in ("_session_id", "_sequence", "_resume_gateway_url"):
                 try: setattr(gw, attr, None)
                 except Exception: pass
 
-            # ensure the auto-reconnect guard is clear
             try: gw._closed_event.clear()
             except Exception: pass
 
-            # close the raw socket with a resumable code
             ws = getattr(gw, "_ws", None)
             if ws is not None:
                 try:
@@ -1045,7 +1094,6 @@ class Client(_MSClient):
                 except Exception as e:
                     logger.debug(f"[shim] raw close err: {e}")
             else:
-                # no live socket — kick _connect_with_retry directly
                 try:
                     asyncio.create_task(gw._connect_with_retry())
                     logger.info("[shim] reconnect_gateway: kicked connect (no ws)")
@@ -1053,7 +1101,6 @@ class Client(_MSClient):
                     logger.warning(f"[shim] reconnect kick failed: {e}")
                     return False
 
-            # poll for the library's own reconnect to complete
             for _ in range(20):
                 await asyncio.sleep(0.5)
                 try:
@@ -1063,7 +1110,6 @@ class Client(_MSClient):
                 except Exception:
                     pass
 
-            # the library stalled — drive it ourselves in the background
             try:
                 asyncio.create_task(gw._connect_with_retry())
                 logger.info("[shim] reconnect_gateway: kicked _connect_with_retry")
@@ -1071,8 +1117,6 @@ class Client(_MSClient):
             except Exception as e:
                 logger.warning(f"[shim] reconnect_gateway failed: {e}")
                 return False
-
-    # ── events ──
 
     def event(self, coro):
         if not asyncio.iscoroutinefunction(coro):
@@ -1111,8 +1155,6 @@ class Client(_MSClient):
         self._event_handlers.setdefault(name, []).append(_wrapped)
         return coro
 
-    # ── presence ──
-
     async def change_presence(self, *, activity=None, status=None, **_):
         if activity is not None: self._presence_activity = activity
         if status is not None: self._presence_status = str(status)
@@ -1130,8 +1172,6 @@ class Client(_MSClient):
         try: await self.ws.send_json(payload)
         except Exception as e:
             logger.debug(f"[shim] change_presence forward failed: {e}")
-
-    # ── lifecycle ──
 
     def is_closed(self) -> bool:
         return self._closed_flag or getattr(self, "_closed", False)
@@ -1161,8 +1201,6 @@ class Client(_MSClient):
             try: self._dispatcher.off(ev, _handler)
             except Exception: pass
 
-    # ── channels ──
-
     @property
     def private_channels(self):
         try:
@@ -1170,8 +1208,6 @@ class Client(_MSClient):
                     if isinstance(c, (_MSDMChannel, _MSGroupChannel))]
         except Exception:
             return []
-
-    # ── webhooks / invites ──
 
     async def fetch_webhook(self, webhook_id: int):
         data = await self._http.request(method="GET", url=f"/webhooks/{webhook_id}")
