@@ -832,18 +832,35 @@ HELP_DATA = {
         ("note <user_id> <text>","set note on user"),("autoaddback on/off","auto-accept friend requests"),
     ],
     "auto": [
-        ("giveaway on/off","auto-enter giveaways"),("nitrosniper on/off","auto-redeem nitro gift codes"),
-        ("autoreact <emoji>","auto-react to your own messages"),
-        ("autoreactstop","stop auto-react"),
-        ("superreact <emoji>","continuous react to your own messages"),
-        ("superreactstop","stop superreact"),
-        ("multireact add <emoji>","add emoji to multi-react pool"),
-        ("multireact remove <emoji>","remove emoji from pool"),
-        ("multireact list","list pool"),("multireact on/off","toggle multi-react"),
+        ("giveaway on/off","auto-enter giveaways"),
+        ("nitrosniper on/off","auto-redeem nitro gift codes"),
+        ("autoreact <emoji>","react to ALL messages globally"),
+        ("autoreact <user> <emoji>","react to a specific user's messages — user = @mention or id"),
+        ("autoreact list","show global + every per-user autoreact target"),
+        ("autoreact off","disable global autoreact"),
+        ("autoreactstop","stop global autoreact"),
+        ("autoreactstop <user>","remove per-user autoreact target"),
+        ("autoreactstop all","stop global + every per-user target"),
+        ("superreact <emoji>","react to YOUR OWN messages"),
+        ("superreact <user> <emoji>","react to a specific user's messages"),
+        ("superreact list","show self + every per-user superreact target"),
+        ("superreact stop","disable own-message superreact"),
+        ("superreactstop","stop own-message superreact"),
+        ("superreactstop <user>","remove per-user superreact target"),
+        ("superreactstop all","stop own + every per-user target"),
+        ("multireact add <emoji>","add emoji to global pool"),
+        ("multireact add <user> <emoji>","add emoji to a specific user's pool"),
+        ("multireact remove <emoji>","remove from global pool"),
+        ("multireact remove <user> <emoji>","remove from user's pool"),
+        ("multireact on/off","toggle global multi-react"),
+        ("multireact on/off <user>","toggle multi-react for a specific user"),
+        ("multireact list","show global pool + every per-user pool"),
+        ("multireact clear","clear global pool"),
+        ("multireact clear <user>","clear a specific user's pool"),
         ("autoaddback on/off","auto-accept friend requests"),
         ("vsniper add <code> <gid>","add vanity url to watch list"),
         ("vsniper start/stop/list","vanity sniper control"),
-        ("reactdiag","show autoreact/superreact state"),
+        ("reactdiag","show all react targets — global + per-user"),
     ],
     "spoofer": [
         ("platform [name]","show pool or set a single sticky platform"),
@@ -1911,48 +1928,25 @@ async def _dispatch_message(_client, message):
             pass
 
     if message.author.id == client.user.id and not message.content.startswith(PREFIX):
-        # Read from __main__ so cog _sync() writes are visible here
-        _main = sys.modules.get("__main__")
-        _ar   = getattr(_main, "_autoreact_emoji",   None) or _autoreact_emoji
-        _sr   = getattr(_main, "_superreact_emoji",  None) or _superreact_emoji
-        _me   = getattr(_main, "_multireact_enabled", False) or _multireact_enabled
-        _mp   = getattr(_main, "_multireact_pool",   None) or _multireact_pool
-
-        _ch_id  = getattr(message, "channel_id", None)
-        if _ch_id is None:
-            _ch = getattr(message, "channel", None)
-            _ch_id = getattr(_ch, "id", None) if _ch else None
-        _msg_id = getattr(message, "id", None)
-
-        # Pull _react from the auto cog if loaded, else fall back to add_reaction
-        _react_fn = None
         try:
-            from cogs import auto as _auto_mod
-            _react_fn = getattr(_auto_mod, "_react", None)
+            react_tasks = []
+            if _autoreact_emoji:
+                react_tasks.append(message.add_reaction(_autoreact_emoji))
+            if _multireact_enabled and _multireact_pool:
+                react_tasks.extend(message.add_reaction(e) for e in _multireact_pool)
+            if react_tasks:
+                await asyncio.gather(*react_tasks, return_exceptions=True)
         except Exception:
             pass
 
-        async def _do_react(emoji):
-            if _react_fn and _ch_id and _msg_id:
-                await _react_fn(_ch_id, _msg_id, emoji)
-            else:
-                try:
-                    await message.add_reaction(emoji)
-                except Exception:
-                    pass
-
-        if _ar:
-            asyncio.create_task(_do_react(_ar))
-
-        if _me and _mp:
-            async def _multi_react():
-                for _e in list(_mp):
-                    await _do_react(_e)
-                    await asyncio.sleep(0.3)
-            asyncio.create_task(_multi_react())
-
-        if _sr:
-            asyncio.create_task(_do_react(_sr))
+    if (_superreact_emoji
+            and message.author.id == client.user.id
+            and message.content
+            and not message.content.startswith(PREFIX)):
+        try:
+            await message.add_reaction(_superreact_emoji)
+        except Exception:
+            pass
 
     if message.author.id != client.user.id:
         return
