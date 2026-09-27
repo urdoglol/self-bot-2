@@ -17,7 +17,7 @@ import time
 import modifyself_shim as discord
 from . import state as S
 
-DEBUG_AFK = False
+DEBUG_AFK = True
 
 
 # ═══════════════════════════════════════════════════════════════════
