@@ -4,6 +4,17 @@
 #  [BUG-1] _perm_check: if a command had entries in _perm_allow, even the owner
 #          would be blocked from it if their uid wasn't in the allowlist.  Added
 #          an _is_owner() bypass so the owner is never locked out by perm_allow.
+#
+#  [BUG-2] _perm_check compared message.author.id (modifyself Snowflake) against
+#          sets/dicts of plain ints (_user_blacklist, _user_whitelist, role IDs,
+#          _perm_channel, _perm_server).  Snowflake.__hash__ returns id>>22 so
+#          set lookups always missed, making blacklist/whitelist/role-restrict
+#          silently do nothing.  Fixed by normalising to int at the top of the
+#          function and using the normalised values throughout.
+#
+#  [NEW]   Per-user react maps for auto.py's user-targeting feature:
+#          _autoreact_users, _superreact_users, _multireact_users,
+#          _multireact_users_on — all keyed by plain int user ID.
 import os
 import re
 import json
@@ -181,23 +192,34 @@ _perm_channel: dict = {}
 _perm_server: dict = {}
 
 def _perm_check(cmd, message) -> bool:
+    # BUG-2 FIX: normalise every ID to plain int once so set/dict lookups use
+    # the correct hash.  modifyself Snowflake.__hash__ returns id>>22 which
+    # differs from hash(int(id)), causing silent misses on every membership test.
+    try:
+        author_id  = int(message.author.id)
+        channel_id = int(getattr(message, 'channel_id', None) or
+                         getattr(getattr(message, 'channel', None), 'id', 0))
+        guild_id   = int(getattr(getattr(message, 'guild', None), 'id', 0) or 0)
+    except Exception:
+        return False
+
     if cmd in _cmd_disabled: return False
-    if message.author.id in _user_blacklist: return False
-    if _user_whitelist and message.author.id not in _user_whitelist: return False
-    if message.guild and str(message.guild.id) in _cmd_blacklist_server:
-        if cmd in _cmd_blacklist_server[str(message.guild.id)]: return False
-    if str(message.channel.id) in _cmd_blacklist_channel:
-        if cmd in _cmd_blacklist_channel[str(message.channel.id)]: return False
+    if author_id in _user_blacklist: return False
+    if _user_whitelist and author_id not in _user_whitelist: return False
+    if guild_id and str(guild_id) in _cmd_blacklist_server:
+        if cmd in _cmd_blacklist_server[str(guild_id)]: return False
+    if str(channel_id) in _cmd_blacklist_channel:
+        if cmd in _cmd_blacklist_channel[str(channel_id)]: return False
     if cmd in _role_restrict:
-        if not message.guild or not hasattr(message.author, "roles"): return False
-        have = {r.id for r in message.author.roles}
+        if not message.guild or not hasattr(message.author, 'roles'): return False
+        have = {int(r.id) for r in message.author.roles}   # normalise role IDs too
         if not (have & _role_restrict[cmd]): return False
     if cmd in _perm_block: return False
-    if cmd in _perm_channel and message.channel.id != _perm_channel[cmd]: return False
-    if cmd in _perm_server and (message.guild is None or message.guild.id != _perm_server[cmd]): return False
+    if cmd in _perm_channel and channel_id != _perm_channel[cmd]: return False
+    if cmd in _perm_server and guild_id != _perm_server[cmd]: return False
     if cmd in _perm_allow and _perm_allow[cmd]:
         # BUG-1 FIX: owner must never be locked out by the perm_allow list
-        return message.author.id in _perm_allow[cmd] or _is_owner(message.author.id)
+        return author_id in _perm_allow[cmd] or _is_owner(author_id)
     return True
 
 HOSTED_TOKENS: list = []
@@ -485,6 +507,13 @@ _giveaway_enabled = False
 _nitrosniper_enabled = True
 _vsniper_list: list = []
 _vsniper_task = None
+
+# Per-user react targeting (set by auto.py commands, read by pre-hook)
+# All dicts are keyed by plain int user ID so set/dict lookups are safe.
+_autoreact_users: dict   = {}   # {uid: emoji}        — autoreact per user
+_superreact_users: dict  = {}   # {uid: emoji}        — superreact per user
+_multireact_users: dict  = {}   # {uid: [emoji, ...]} — pool per user
+_multireact_users_on: dict = {} # {uid: bool}         — per-user enabled flag
 _afk_enabled = False
 _afk_msg = None
 _autodelete_secs = 0

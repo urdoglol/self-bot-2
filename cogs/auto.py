@@ -1,50 +1,42 @@
 # cogs/auto.py | giveaway, nitrosniper, autoreact, multireact, vsniper, superreact
 #
-# FIXES vs original:
-#  [BUG-1] _react_once returned ("err:...", None) — a str — but callers did
-#          `status, retry_after = ...` and then compared `status == 429` (int).
-#          An error string never matched, so the loop silently swallowed every
-#          network/connection error and returned the last bad status.  Fixed by
-#          always returning a 2-tuple and treating non-int status as a hard fail.
+# NEW: per-user react targeting
+#   .autoreact <emoji>               — react to ALL messages (global)
+#   .autoreact <@user|userid> <emoji>— react only to that user's messages
+#   .autoreact list                  — show all active targets
+#   .autoreact off                   — disable global autoreact
+#   .autoreactstop [<@user|uid>|all] — stop global, per-user, or everything
 #
-#  [BUG-2] Custom-emoji encoding was wrong for the REST reaction endpoint.
-#          Discord expects   name:id   (no angle brackets, no "a:" prefix in the
-#          URL path) for custom emoji, and the plain codepoint for unicode emoji.
-#          The original just urllib-encoded the full "<a:name:id>" string which
-#          produced %3Ca%3Aname%3Aid%3E — Discord rejected it with 400.
-#          Fixed in _emoji_url_part().
+#   .superreact <emoji>              — react to YOUR OWN messages (unchanged)
+#   .superreact <@user|userid> <emoji>— react to a specific user's messages
+#   .superreact list                 — show all targets
+#   .superreactstop [<@user|uid>|all]— stop own, per-user, or everything
 #
-#  [BUG-3] autoreact / superreact / multireact stored args[1] raw.  When a user
-#          typed a custom emoji like <:zaraki:123456> the shell/Discord client
-#          sometimes passes it as a single token, sometimes split across args.
-#          Added _parse_emoji_arg() which re-joins args and extracts the emoji
-#          correctly whether it is a unicode char, :name: shortcode, or the full
-#          <[a]:name:id> form.
+#   .multireact add <emoji>              — add to global pool
+#   .multireact add <@user|uid> <emoji>  — add to user's personal pool
+#   .multireact remove <emoji>           — remove from global pool
+#   .multireact remove <@user|uid> <emoji>
+#   .multireact on/off [<@user|uid>]     — enable/disable global or per-user
+#   .multireact list                     — show all pools + user pools
+#   .multireact clear [<@user|uid>]      — clear global or user pool
 #
-#  [BUG-4] multireact "add" compared args[2] (raw string) against pool entries
-#          that might have been normalised differently — duplicate-check could
-#          fail.  Now we normalise before comparing.
+# HOW IT WORKS:
+#   - Per-user maps (_autoreact_users, _superreact_users, _multireact_users)
+#     live on the cog instance.
+#   - A pre-hook registered via S.register_pre_hook() fires on every incoming
+#     message and dispatches per-user reactions + global reactions for
+#     OTHER users' messages.
+#   - selfbot.py already handles own-message reactions via _sync() → no
+#     double-react on own messages.
 #
-#  [BUG-5] superreact stored args[1].lower() when checking "stop/off/disable",
-#          but then stored the lowercased string as the emoji.  If the sub was
-#          NOT a control word the branch fell through and stored the lowercased
-#          emoji name, breaking case-sensitive custom emoji names.  Fixed.
-#
-#  [BUG-6] vsniper loop created a new aiohttp.ClientSession() per entry per
-#          tick — up to hundreds of sessions/second for large watch lists.
-#          Fixed: one session per loop tick, shared across entries.
-#
-#  [BUG-7] _install_react_patch() patched Message.add_reaction but the fallback
-#          only checked status in (200, 204).  Discord returns 204 No Content on
-#          success; 200 is never returned for PUT reactions.  The 200 check is
-#          harmless but the real bug was that any non-204 non-200 int (e.g. 403)
-#          silently re-raised the original shim error instead of a useful one.
-#          Now raises a descriptive RuntimeError on unexpected status codes.
-#
-#  [NEW]   _resolve_custom_emoji(client, name) — looks up a custom emoji by name
-#          across all guilds the selfbot is in, returning the correct URL-encoded
-#          path component so commands like  autoreact :zaraki:  work without
-#          needing the full <:zaraki:123456789> syntax.
+# BUGS CARRIED FORWARD FROM PREVIOUS VERSION (all still fixed):
+#   [BUG-1] _react_once always returns int status tuple (never str)
+#   [BUG-2] _emoji_url_part strips angle-brackets correctly for custom emoji
+#   [BUG-3] _parse_emoji_arg re-joins split tokens and uses raw_content
+#   [BUG-4] multireact duplicate check uses normalised emoji string
+#   [BUG-5] superreact control-word check before emoji parse (no lowercasing)
+#   [BUG-6] vsniper uses one session per tick, not per entry
+#   [BUG-7] react patch raises descriptive error on non-204
 
 import asyncio
 import re
@@ -55,19 +47,69 @@ import aiohttp
 import modifyself_shim as discord
 from . import state as S
 
-# ---------------------------------------------------------------------------
-# Regex patterns for emoji forms
-# ---------------------------------------------------------------------------
-_RE_CUSTOM   = re.compile(r"<(a?):([A-Za-z0-9_]+):(\d+)>")   # <a:name:id> or <:name:id>
-_RE_SHORTCODE = re.compile(r":([A-Za-z0-9_]+):")               # :name:  (no id)
+# ─────────────────────────────────────────────────────────────────────────────
+# Regex
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RE_CUSTOM    = re.compile(r"<(a?):([A-Za-z0-9_]+):(\d+)>")
+_RE_SHORTCODE = re.compile(r":([A-Za-z0-9_]+):")
+_RE_MENTION   = re.compile(r"<@!?(\d+)>")
+_RE_UID       = re.compile(r"^\d{15,20}$")
+_RE_NITRO     = re.compile(r"discord\.gift/([A-Za-z0-9]+)")
+_RE_GIVEAWAY  = re.compile(r"🎉|giveaway", re.IGNORECASE)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# User-ID parsing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_user_id(token: str):
+    """
+    Extract a Discord user ID from a <@mention> or a raw 15-20 digit string.
+    Returns int or None.
+    """
+    m = _RE_MENTION.match(token.strip())
+    if m:
+        return int(m.group(1))
+    if _RE_UID.match(token.strip()):
+        return int(token.strip())
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+def _parse_user_and_emoji(args: list, start: int = 1,
+                           raw_content: str = "") -> tuple:
+    """
+    Parse (user_id_or_None, emoji_str_or_None) from args[start:].
+
+    If args[start] looks like a user mention or numeric ID, treat it as the
+    user target and parse the emoji from args[start+1:].
+    Otherwise parse the emoji starting at args[start] with no user.
+
+    Returns:
+        (uid: int | None, emoji: str | None)
+    """
+    if len(args) <= start:
+        return None, None
+
+    uid = _parse_user_id(args[start])
+
+    if uid is not None:
+        # User found at args[start]; emoji follows at args[start+1]
+        if len(args) <= start + 1:
+            return uid, None  # user given but no emoji
+        emoji = _parse_emoji_arg(args, start + 1, raw_content)
+        return uid, emoji or None
+    else:
+        # No user; emoji starts at args[start]
+        emoji = _parse_emoji_arg(args, start, raw_content)
+        return None, emoji or None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Emoji helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _sync(**kw):
-    """Mirror state values onto __main__ so other modules see them."""
+    """Mirror state values onto __main__ so selfbot.py sees them."""
     main = sys.modules.get("__main__")
     if main is None:
         return
@@ -79,112 +121,85 @@ def _sync(**kw):
 
 
 def _emoji_to_str(emoji) -> str:
-    """Convert an emoji object or string to its canonical string form."""
     if isinstance(emoji, str):
         return emoji
     name     = getattr(emoji, "name",     None)
     eid      = getattr(emoji, "id",       None)
     animated = getattr(emoji, "animated", False)
     if name and eid:
-        prefix = "a" if animated else ""
-        return f"<{prefix}:{name}:{eid}>"
-    if name:
-        return str(name)
-    return str(emoji)
+        return f"<{'a' if animated else ''}:{name}:{eid}>"
+    return str(name or emoji)
 
 
 def _emoji_url_part(emoji_str: str) -> str:
     """
-    Convert an emoji string to the correctly encoded URL path segment for
-    Discord's reaction endpoint.
-
-    Discord REST API rules:
-      • Unicode emoji  →  percent-encode the raw codepoints
-                          e.g.  👍  →  %F0%9F%91%8D
-      • Custom emoji   →  name:id   (NO angle brackets, NO "a:" prefix)
-                          e.g.  <a:zaraki:123456>  →  zaraki:123456
-                          then percent-encode just the colon:  zaraki%3A123456
-
-    BUG-2 fix: the original code encoded the full "<a:name:id>" string which
-    Discord rejected with HTTP 400.
+    Encode emoji for Discord's PUT reaction URL.
+    Custom <a:name:id> / <:name:id>  →  name%3Aid  (no angle brackets)
+    Unicode                           →  percent-encoded codepoints
     """
     m = _RE_CUSTOM.match(emoji_str.strip())
     if m:
-        # Custom emoji: drop < > and animated prefix; keep name:id
-        name, eid = m.group(2), m.group(3)
-        return urllib.parse.quote(f"{name}:{eid}", safe="")
-    # Unicode / plain text emoji
+        return urllib.parse.quote(f"{m.group(2)}:{m.group(3)}", safe="")
     return urllib.parse.quote(emoji_str, safe="")
 
 
-def _parse_emoji_arg(args: list, start: int = 1) -> str:
+def _parse_emoji_arg(args: list, start: int = 1,
+                     raw_content: str = "") -> str:
     """
-    Re-join args from `start` onwards and extract the first emoji-like token.
+    Extract the first emoji from args[start:], using raw_content for split
+    tokens (e.g. <:name:id> split into ["<:name", "id>"] by the parser).
 
-    Handles:
-      • Single unicode emoji:       👍
-      • Custom emoji full form:     <:zaraki:123456>  or  <a:zaraki:123456>
-      • Shortcode (name only):      :zaraki:
-      • Plain name (fallback):      zaraki
-
-    BUG-3 fix: args can be split mid-emoji by the command parser.
+    Priority:
+      1. raw_content  — search original message text past `start` whitespace-
+                        tokens; most reliable for custom emoji
+      2. re-joined args — catches <:name:id> split across args
+      3. first token  — unicode emoji or plain word
     """
-    raw = " ".join(args[start:]).strip()
+    # 1. raw_content: skip past `start` whitespace tokens, search the rest
+    if raw_content:
+        parts = raw_content.split(None, start)
+        remainder = parts[-1] if len(parts) > start else ""
+        m = _RE_CUSTOM.search(remainder)
+        if m:
+            return m.group(0)
+        m = _RE_SHORTCODE.search(remainder)
+        if m:
+            return m.group(0)
 
-    # Full custom emoji (may have been split across tokens — rejoin first)
-    m = _RE_CUSTOM.search(raw)
+    # 2. Re-joined args
+    joined = " ".join(args[start:]).strip()
+    m = _RE_CUSTOM.search(joined)
+    if m:
+        return m.group(0)
+    m = _RE_SHORTCODE.search(joined)
     if m:
         return m.group(0)
 
-    # Shortcode :name:
-    m = _RE_SHORTCODE.search(raw)
-    if m:
-        return m.group(0)   # keep as :name: for _resolve_custom_emoji later
-
-    # Return first whitespace-free token (unicode emoji or plain word)
-    return raw.split()[0] if raw.split() else raw
+    # 3. First token
+    return joined.split()[0] if joined.split() else joined
 
 
-def _resolve_custom_emoji(client, name_or_shortcode: str):
-    """
-    Given  :zaraki:  or  zaraki  try to find the matching custom emoji across
-    all guilds and return the full  <a:name:id>  string.
-
-    Returns the original string unchanged if nothing is found.
-    This lets users type  autoreact :zaraki:  without knowing the emoji ID.
-    """
-    target = name_or_shortcode.strip(": ").lower()
-    guilds = getattr(client, "guilds", None) or []
-    for guild in guilds:
-        for emoji in getattr(guild, "emojis", []):
-            if getattr(emoji, "name", "").lower() == target:
-                animated = getattr(emoji, "animated", False)
-                eid      = getattr(emoji, "id",       None)
-                ename    = getattr(emoji, "name",     target)
-                prefix   = "a" if animated else ""
-                return f"<{prefix}:{ename}:{eid}>"
-    return name_or_shortcode   # unchanged — might be unicode or unknown
+def _resolve_emoji(client, raw: str) -> str:
+    """Resolve :shortcode: / bare name → <:name:id> by searching joined guilds."""
+    if _RE_CUSTOM.match(raw.strip()):
+        return raw
+    target = raw.strip(": ").lower()
+    for guild in (getattr(client, "guilds", None) or []):
+        for e in getattr(guild, "emojis", []):
+            if getattr(e, "name", "").lower() == target:
+                prefix = "a" if getattr(e, "animated", False) else ""
+                return f"<{prefix}:{e.name}:{e.id}>"
+    return raw
 
 
-# ---------------------------------------------------------------------------
-# Core reaction REST call
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# REST reaction
+# ─────────────────────────────────────────────────────────────────────────────
 
-async def _react_once(session: aiohttp.ClientSession,
-                      channel_id, message_id, emoji) -> tuple:
-    """
-    PUT one reaction.  Always returns a 2-tuple (status, retry_after).
-
-    BUG-1 fix: previously returned ("err:...", None) on exception which broke
-    the int comparison in _react().  Now returns (-1, None) on error so the
-    caller can handle it uniformly.
-    """
-    emoji_str = _emoji_to_str(emoji)
-    emoji_enc = _emoji_url_part(emoji_str)          # BUG-2 fix
-    url = (
-        f"https://discord.com/api/v9/channels/{channel_id}"
-        f"/messages/{message_id}/reactions/{emoji_enc}/@me"
-    )
+async def _react_once(session, channel_id, message_id, emoji) -> tuple:
+    emoji_enc = _emoji_url_part(_emoji_to_str(emoji))
+    url = (f"https://discord.com/api/v9/channels/{channel_id}"
+           f"/messages/{message_id}/reactions/{emoji_enc}/@me")
     headers = {
         "Authorization":  S.TOKEN,
         "User-Agent":     S.USER_AGENT,
@@ -202,345 +217,681 @@ async def _react_once(session: aiohttp.ClientSession,
                 return 429, ra
             return r.status, None
     except Exception as e:
-        print(f"[auto] _react_once network error: {e}")
-        return -1, None     # BUG-1 fix: always return int status
+        print(f"[auto] react network error: {e}")
+        return -1, None
 
 
 async def _react(channel_id, message_id, emoji, session=None) -> int:
-    """
-    Retry-aware reaction sender.  Retries up to 4 times on 429.
-    Returns the final HTTP status code (int).
-    """
-    own_session = session is None
-    if own_session:
+    own = session is None
+    if own:
         session = aiohttp.ClientSession()
     try:
         for attempt in range(4):
             status, retry_after = await _react_once(
                 session, channel_id, message_id, emoji)
-
             if status == 429:
-                wait = max(float(retry_after or 1.0), 0.5)
-                print(f"[auto] rate-limited, sleeping {wait:.2f}s (attempt {attempt+1})")
-                await asyncio.sleep(wait)
+                await asyncio.sleep(max(float(retry_after or 1.0), 0.5))
                 continue
-
             if status == -1:
-                # network error — short backoff then retry
                 await asyncio.sleep(0.5)
                 continue
-
-            return status   # success or hard Discord error (400, 403, …)
-
-        return 429  # exhausted retries
+            return status
+        return 429
     finally:
-        if own_session:
+        if own:
             await session.close()
 
 
-# ---------------------------------------------------------------------------
+async def _react_pool(channel_id, message_id, pool: list):
+    """React with every emoji in `pool`, one session, 0.3s gap."""
+    async with aiohttp.ClientSession() as sess:
+        for emoji in pool:
+            status = await _react(channel_id, message_id, emoji, session=sess)
+            if status not in (200, 204):
+                print(f"[auto] multireact failed {emoji!r} → HTTP {status}")
+            await asyncio.sleep(0.3)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Message.add_reaction shim patch
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _install_react_patch():
     try:
-        from modifyself.models.message import Message as _MSMessage
+        from modifyself.models.message import Message as M
     except ImportError as e:
-        print(f"[auto] cannot import Message for react patch: {e}")
+        print(f"[auto] react patch import failed: {e}")
         return False
 
-    if getattr(_MSMessage, "_raw_react_patched", False):
+    if getattr(M, "_raw_react_patched", False):
         return True
 
-    original = _MSMessage.add_reaction
+    _orig = M.add_reaction
 
-    async def patched_add_reaction(self, emoji, *args, **kwargs):
+    async def _patched(self, emoji, *a, **kw):
         try:
-            return await original(self, emoji, *args, **kwargs)
-        except Exception as shim_err:
-            ch_id  = getattr(self, "channel_id", None)
+            return await _orig(self, emoji, *a, **kw)
+        except Exception as err:
+            ch_id = getattr(self, "channel_id", None)
             if ch_id is None:
                 ch    = getattr(self, "channel", None)
-                ch_id = getattr(ch, "id", None) if ch is not None else None
+                ch_id = getattr(ch, "id", None) if ch else None
             msg_id = getattr(self, "id", None)
-            if ch_id is None or msg_id is None:
-                raise shim_err
-
+            if not ch_id or not msg_id:
+                raise err
             status = await _react(ch_id, msg_id, emoji)
-
-            # BUG-7 fix: Discord only ever returns 204 for PUT reactions.
-            # Treat 204 (and 200 defensively) as success; anything else is
-            # a real failure — raise a descriptive error instead of the
-            # original shim error which had no useful info.
             if isinstance(status, int) and status in (200, 204):
                 return None
             raise RuntimeError(
-                f"[auto] raw react failed: HTTP {status} "
-                f"(ch={ch_id} msg={msg_id} emoji={_emoji_to_str(emoji)!r})"
-            )
+                f"[auto] react failed HTTP {status} "
+                f"ch={ch_id} msg={msg_id} emoji={_emoji_to_str(emoji)!r}")
 
-    _MSMessage.add_reaction       = patched_add_reaction
-    _MSMessage._raw_react_patched = True
-    print("[auto] Message.add_reaction patched (shim → raw REST fallback)")
+    M.add_reaction       = _patched
+    M._raw_react_patched = True
+    print("[auto] Message.add_reaction patched")
     return True
 
 
-# ---------------------------------------------------------------------------
-# Vanity-URL sniper loop
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Nitro sniper
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _snipe_nitro(code: str):
+    url = f"https://discord.com/api/v9/entitlements/gift-codes/{code}/redeem"
+    headers = {"Authorization": S.TOKEN, "User-Agent": S.USER_AGENT,
+               "Content-Type": "application/json"}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(url, headers=headers, json={}) as r:
+                body = {}
+                try:
+                    body = await r.json(content_type=None)
+                except Exception:
+                    pass
+                result = "CLAIMED" if r.status == 200 else f"FAILED ({r.status})"
+                if S.log_msg:
+                    S.log_msg("NITRO", f"{result} discord.gift/{code} → {body}")
+    except Exception as e:
+        if S.log_msg:
+            S.log_msg("NITRO", f"error: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vanity sniper
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def _vsniper_loop():
-    """
-    BUG-6 fix: original created one aiohttp.ClientSession per entry per tick,
-    potentially hundreds per second for large watch lists.  One session per
-    tick is correct.
-    """
     while True:
         entries = list(S._vsniper_list)
         if entries:
-            h = {
-                "Authorization":  S.TOKEN,
-                "Content-Type":   "application/json",
-                "User-Agent":     S.USER_AGENT,
-            }
-            async with aiohttp.ClientSession() as s:       # BUG-6 fix
+            h = {"Authorization": S.TOKEN, "Content-Type": "application/json",
+                 "User-Agent": S.USER_AGENT}
+            async with aiohttp.ClientSession() as s:   # one session per tick
                 for entry in entries:
-                    code     = entry["code"]
-                    guild_id = entry["guild_id"]
+                    code, guild_id = entry["code"], entry["guild_id"]
                     try:
                         async with s.get(
-                            f"https://discord.com/api/v9/invites/{code}",
-                            headers=h
+                            f"https://discord.com/api/v9/invites/{code}", headers=h
                         ) as r:
                             if r.status == 404:
                                 async with s.patch(
                                     f"https://discord.com/api/v9/guilds/{guild_id}/vanity-url",
-                                    headers=h,
-                                    json={"code": code},
+                                    headers=h, json={"code": code}
                                 ) as r2:
                                     if r2.status in (200, 204) and S.log_msg:
                                         S.log_msg("VSNIPER",
-                                                  f"CLAIMED {code} for guild {guild_id}")
+                                                  f"CLAIMED {code} guild={guild_id}")
                     except Exception as e:
-                        print(f"[auto] vsniper error for {code}: {e}")
+                        print(f"[auto] vsniper error {code}: {e}")
         await asyncio.sleep(0.5)
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-hook factory  (per-user reactions + global-other-users reactions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_pre_hook(cog: "AutoCog"):
+    """
+    Build the per-message pre-hook that is registered via S.register_pre_hook().
+
+    Responsibilities:
+      • Global autoreact   — react to OTHER users' messages (selfbot.py handles own)
+      • Global multireact  — same
+      • Per-user autoreact — react to specific users' messages
+      • Per-user superreact— react to specific users' messages (second emoji slot)
+      • Per-user multireact— react with a per-user pool
+      • Nitro sniper       — scan other-user messages for gift links
+      • Giveaway auto-enter
+    """
+    async def _hook(client, message):
+        ch_id = getattr(message, "channel_id", None)
+        if ch_id is None:
+            ch    = getattr(message, "channel", None)
+            ch_id = getattr(ch, "id", None) if ch else None
+        msg_id = getattr(message, "id", None)
+        if not ch_id or not msg_id:
+            return
+
+        try:
+            author_id = int(getattr(getattr(message, "author", None), "id", 0) or 0)
+        except Exception:
+            return
+        if author_id == 0:
+            return
+
+        try:
+            my_id = int(getattr(getattr(client, "user", None), "id", 0) or 0)
+        except Exception:
+            my_id = 0
+
+        content = getattr(message, "content", "") or ""
+
+        # ── nitro sniper ─────────────────────────────────────────────────────
+        if S._nitrosniper_enabled and author_id != my_id:
+            for code in _RE_NITRO.findall(content):
+                asyncio.create_task(_snipe_nitro(code))
+
+        # ── giveaway ─────────────────────────────────────────────────────────
+        if S._giveaway_enabled and _RE_GIVEAWAY.search(content):
+            asyncio.create_task(_react(ch_id, msg_id, "🎉"))
+
+        # ── global autoreact — other users only (selfbot.py does own) ────────
+        if S._autoreact_emoji and author_id != my_id:
+            asyncio.create_task(_react(ch_id, msg_id, S._autoreact_emoji))
+
+        # ── global multireact — other users only ─────────────────────────────
+        if S._multireact_enabled and S._multireact_pool and author_id != my_id:
+            asyncio.create_task(
+                _react_pool(ch_id, msg_id, list(S._multireact_pool)))
+
+        # ── per-user autoreact ────────────────────────────────────────────────
+        if author_id in cog._autoreact_users:
+            asyncio.create_task(
+                _react(ch_id, msg_id, cog._autoreact_users[author_id]))
+
+        # ── per-user superreact ───────────────────────────────────────────────
+        if author_id in cog._superreact_users:
+            asyncio.create_task(
+                _react(ch_id, msg_id, cog._superreact_users[author_id]))
+
+        # ── per-user multireact ───────────────────────────────────────────────
+        if (author_id in cog._multireact_users
+                and cog._multireact_users_on.get(author_id, False)):
+            pool = list(cog._multireact_users[author_id])
+            if pool:
+                asyncio.create_task(_react_pool(ch_id, msg_id, pool))
+
+    return _hook
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AutoCog
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class AutoCog:
     COMMANDS = {
         "giveaway", "nitrosniper",
         "autoreact", "autoreactstop",
+        "superreact", "superreactstop",
         "multireact", "multiautoreact",
         "vsniper",
-        "superreact", "superreactstop",
         "reactdiag",
     }
 
     def __init__(self):
         _install_react_patch()
+        # Per-user react targets — keyed by int user ID
+        self._autoreact_users:     dict = {}   # {uid: emoji}
+        self._superreact_users:    dict = {}   # {uid: emoji}
+        self._multireact_users:    dict = {}   # {uid: [emoji, ...]}
+        self._multireact_users_on: dict = {}   # {uid: bool}
 
-    # ------------------------------------------------------------------
-    # Utility: get the client from state if available (for emoji lookup)
-    # ------------------------------------------------------------------
+    def register(self, client):
+        """Wire the per-message pre-hook into the selfbot's event stream."""
+        S.register_pre_hook(_make_pre_hook(self))
+
+    # ── internal ──────────────────────────────────────────────────────────────
+
     @staticmethod
     def _client():
         main = sys.modules.get("__main__")
         return getattr(main, "client", None) if main else None
 
     def _resolve(self, raw: str) -> str:
-        """
-        Resolve :shortcode: → full <:name:id> using joined guilds.
-        Passes through unicode emoji and already-full custom emoji unchanged.
-        """
         if _RE_CUSTOM.match(raw.strip()):
-            return raw  # already full form
-        if _RE_SHORTCODE.match(raw.strip()) or not raw.startswith("<"):
-            client = self._client()
-            if client:
-                return _resolve_custom_emoji(client, raw)
-        return raw
+            return raw
+        client = self._client()
+        return _resolve_emoji(client, raw) if client else raw
 
-    # ------------------------------------------------------------------
-    # Command handler
-    # ------------------------------------------------------------------
+    def _ulabel(self, uid: int) -> str:
+        return f"<@{uid}> ({uid})"
+
+    # ── dispatch ──────────────────────────────────────────────────────────────
 
     async def handle(self, message, cmd, args):
+        rc = getattr(message, "content", "") or ""   # raw content for emoji parse
 
-        # ── giveaway ───────────────────────────────────────────────────
         if cmd == "giveaway":
             S._giveaway_enabled = len(args) < 2 or args[1].lower() in ("on", "enable")
             _sync(_giveaway_enabled=S._giveaway_enabled)
             await message.edit(content=S.ui_ok(
                 f"giveaway → {'on' if S._giveaway_enabled else 'off'}"))
 
-        # ── nitrosniper ────────────────────────────────────────────────
         elif cmd == "nitrosniper":
             S._nitrosniper_enabled = len(args) < 2 or args[1].lower() in ("on", "enable")
             _sync(_nitrosniper_enabled=S._nitrosniper_enabled)
             await message.edit(content=S.ui_ok(
                 f"nitrosniper → {'on' if S._nitrosniper_enabled else 'off'}"))
 
-        # ── autoreact ──────────────────────────────────────────────────
         elif cmd == "autoreact":
-            if len(args) < 2:
-                return await message.edit(
-                    content=S.ui_err("usage: autoreact <emoji>  (unicode, :name:, or <:name:id>)"))
-            # BUG-3 fix: parse + resolve custom emoji
-            raw = _parse_emoji_arg(args, 1)
-            emoji = self._resolve(raw)
-            S._autoreact_emoji = emoji
-            _sync(_autoreact_emoji=emoji)
-            await message.edit(content=S.ui_ok(f"reacting with {emoji}"))
+            await self._autoreact(message, args, rc)
 
-        # ── autoreactstop ──────────────────────────────────────────────
         elif cmd == "autoreactstop":
+            await self._autoreactstop(message, args)
+
+        elif cmd == "superreact":
+            await self._superreact(message, args, rc)
+
+        elif cmd == "superreactstop":
+            await self._superreactstop(message, args)
+
+        elif cmd in ("multireact", "multiautoreact"):
+            await self._multireact(message, args, rc)
+
+        elif cmd == "vsniper":
+            await self._vsniper(message, args)
+
+        elif cmd == "reactdiag":
+            await self._reactdiag(message)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # .autoreact
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _autoreact(self, message, args, rc):
+        """
+        .autoreact <emoji>               — react to ALL messages (global)
+        .autoreact <@user|uid> <emoji>   — react to that user's messages only
+        .autoreact list                  — show every active target
+        .autoreact off                   — disable global autoreact
+        """
+        if len(args) < 2:
+            return await message.edit(content=S.ui_err(
+                "usage: autoreact <emoji>"
+                "  |  autoreact <@user|uid> <emoji>"
+                "  |  autoreact list  |  autoreact off"))
+
+        sub = args[1].lower()
+
+        if sub == "list":
+            rows = [f"  {S.DIM}global{S.RESET}  "
+                    f"{'off' if not S._autoreact_emoji else S._autoreact_emoji}"]
+            for uid, emoji in sorted(self._autoreact_users.items()):
+                rows.append(f"  {S.GREY}•{S.RESET} {self._ulabel(uid)}  →  {emoji}")
+            return await message.edit(content=S.ui_box("autoreact targets", rows))
+
+        if sub in ("off", "stop", "disable"):
             S._autoreact_emoji = None
             _sync(_autoreact_emoji=None)
-            await message.edit(content=S.ui_ok("autoreact → stopped"))
+            return await message.edit(content=S.ui_ok("autoreact → off (global)"))
 
-        # ── superreact ─────────────────────────────────────────────────
-        elif cmd == "superreact":
-            if len(args) < 2:
-                return await message.edit(
-                    content=S.ui_err(
-                        "usage: superreact <emoji>  |  superreact stop\n"
-                        "       emoji can be unicode, :name:, or <:name:id>"))
+        uid, raw_emoji = _parse_user_and_emoji(args, 1, rc)
 
-            # BUG-5 fix: check control word BEFORE lowercasing the emoji
-            ctrl = args[1].lower()
-            if ctrl in ("stop", "off", "disable"):
-                S._superreact_emoji = None
-                _sync(_superreact_emoji=None)
-                return await message.edit(content=S.ui_ok("superreact → off"))
+        if uid is not None and raw_emoji is None:
+            return await message.edit(content=S.ui_err(
+                f"usage: autoreact {self._ulabel(uid)} <emoji>"))
 
-            raw   = _parse_emoji_arg(args, 1)
-            emoji = self._resolve(raw)
+        if raw_emoji is None:
+            return await message.edit(content=S.ui_err(
+                "couldn't read emoji — paste it directly after the command"))
+
+        emoji = self._resolve(raw_emoji)
+
+        if uid is not None:
+            self._autoreact_users[uid] = emoji
+            await message.edit(content=S.ui_ok(
+                f"autoreact → {emoji}  (messages from {self._ulabel(uid)})"))
+        else:
+            S._autoreact_emoji = emoji
+            _sync(_autoreact_emoji=emoji)
+            await message.edit(content=S.ui_ok(
+                f"autoreact → {emoji}  (all messages)"))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # .autoreactstop
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _autoreactstop(self, message, args):
+        """
+        .autoreactstop              — stop global autoreact
+        .autoreactstop <@user|uid>  — remove per-user target
+        .autoreactstop all          — stop global + every per-user target
+        """
+        if len(args) >= 2:
+            sub = args[1].lower()
+            if sub == "all":
+                S._autoreact_emoji = None
+                _sync(_autoreact_emoji=None)
+                n = len(self._autoreact_users)
+                self._autoreact_users.clear()
+                return await message.edit(content=S.ui_ok(
+                    f"autoreact → off  (global + {n} user target(s) cleared)"))
+            uid = _parse_user_id(args[1])
+            if uid is not None:
+                if uid in self._autoreact_users:
+                    del self._autoreact_users[uid]
+                    return await message.edit(content=S.ui_ok(
+                        f"autoreact → off for {self._ulabel(uid)}"))
+                return await message.edit(content=S.ui_info(
+                    f"no autoreact target set for {self._ulabel(uid)}"))
+
+        S._autoreact_emoji = None
+        _sync(_autoreact_emoji=None)
+        await message.edit(content=S.ui_ok("autoreact → off (global)"))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # .superreact
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _superreact(self, message, args, rc):
+        """
+        .superreact <emoji>              — react to YOUR OWN messages
+        .superreact <@user|uid> <emoji>  — react to that user's messages
+        .superreact list                 — show every active target
+        .superreact stop / off           — disable own-message superreact
+        """
+        if len(args) < 2:
+            return await message.edit(content=S.ui_err(
+                "usage: superreact <emoji>"
+                "  |  superreact <@user|uid> <emoji>"
+                "  |  superreact list  |  superreact stop"))
+
+        sub = args[1].lower()
+
+        if sub == "list":
+            rows = [f"  {S.DIM}self{S.RESET}  "
+                    f"{'off' if not S._superreact_emoji else S._superreact_emoji}"]
+            for uid, emoji in sorted(self._superreact_users.items()):
+                rows.append(f"  {S.GREY}•{S.RESET} {self._ulabel(uid)}  →  {emoji}")
+            return await message.edit(content=S.ui_box("superreact targets", rows))
+
+        if sub in ("stop", "off", "disable"):
+            S._superreact_emoji = None
+            _sync(_superreact_emoji=None)
+            return await message.edit(content=S.ui_ok(
+                "superreact → off (own messages)"))
+
+        uid, raw_emoji = _parse_user_and_emoji(args, 1, rc)
+
+        if uid is not None and raw_emoji is None:
+            return await message.edit(content=S.ui_err(
+                f"usage: superreact {self._ulabel(uid)} <emoji>"))
+
+        if raw_emoji is None:
+            return await message.edit(content=S.ui_err(
+                "couldn't read emoji — paste it directly after the command"))
+
+        emoji = self._resolve(raw_emoji)
+
+        if uid is not None:
+            self._superreact_users[uid] = emoji
+            await message.edit(content=S.ui_ok(
+                f"superreact → {emoji}  (messages from {self._ulabel(uid)})"))
+        else:
             S._superreact_emoji = emoji
             _sync(_superreact_emoji=emoji)
             await message.edit(content=S.ui_ok(
-                f"superreact → {emoji}  (reacting to your msgs)"))
+                f"superreact → {emoji}  (your own messages)"))
 
-        # ── superreactstop ─────────────────────────────────────────────
-        elif cmd == "superreactstop":
-            S._superreact_emoji = None
-            _sync(_superreact_emoji=None)
-            await message.edit(content=S.ui_ok("superreact → off"))
+    # ─────────────────────────────────────────────────────────────────────────
+    # .superreactstop
+    # ─────────────────────────────────────────────────────────────────────────
 
-        # ── reactdiag ──────────────────────────────────────────────────
-        elif cmd == "reactdiag":
-            try:
-                from modifyself.models.message import Message as _MSMessage
-                patched = bool(getattr(_MSMessage, "_raw_react_patched", False))
-            except ImportError:
-                patched = "import-failed"
-            main      = sys.modules.get("__main__")
-            main_ar   = getattr(main, "_autoreact_emoji",   None) if main else None
-            main_sr   = getattr(main, "_superreact_emoji",  None) if main else None
-            main_multi = getattr(main, "_multireact_enabled", None) if main else None
-            lines = [
-                f"  patch installed:     {patched}",
-                f"  S._autoreact_emoji:  {S._autoreact_emoji!r}",
-                f"  main._autoreact:     {main_ar!r}",
-                f"  S._superreact_emoji: {S._superreact_emoji!r}",
-                f"  main._superreact:    {main_sr!r}",
-                f"  S._multireact_en:    {S._multireact_enabled}",
-                f"  main._multireact:    {main_multi}",
-                f"  pool (S):            {S._multireact_pool}",
-                f"  __main__ present:    {main is not None}",
-            ]
-            await message.edit(content=S._ansi_block(lines))
+    async def _superreactstop(self, message, args):
+        """
+        .superreactstop              — stop own-message superreact
+        .superreactstop <@user|uid>  — remove per-user target
+        .superreactstop all          — stop everything
+        """
+        if len(args) >= 2:
+            sub = args[1].lower()
+            if sub == "all":
+                S._superreact_emoji = None
+                _sync(_superreact_emoji=None)
+                n = len(self._superreact_users)
+                self._superreact_users.clear()
+                return await message.edit(content=S.ui_ok(
+                    f"superreact → off  (self + {n} user target(s) cleared)"))
+            uid = _parse_user_id(args[1])
+            if uid is not None:
+                if uid in self._superreact_users:
+                    del self._superreact_users[uid]
+                    return await message.edit(content=S.ui_ok(
+                        f"superreact → off for {self._ulabel(uid)}"))
+                return await message.edit(content=S.ui_info(
+                    f"no superreact target set for {self._ulabel(uid)}"))
 
-        # ── multireact / multiautoreact ────────────────────────────────
-        elif cmd in ("multireact", "multiautoreact"):
-            sub = args[1].lower() if len(args) > 1 else ""
+        S._superreact_emoji = None
+        _sync(_superreact_emoji=None)
+        await message.edit(content=S.ui_ok("superreact → off (own messages)"))
 
-            if sub == "add" and len(args) >= 3:
-                # BUG-3 + BUG-4 fix: parse & resolve before duplicate check
-                raw   = _parse_emoji_arg(args, 2)
-                emoji = self._resolve(raw)
-                # BUG-4: compare normalised form
+    # ─────────────────────────────────────────────────────────────────────────
+    # .multireact
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _multireact(self, message, args, rc):
+        """
+        .multireact add <emoji>                 — add to global pool
+        .multireact add <@user|uid> <emoji>     — add to user pool
+        .multireact remove <emoji>              — remove from global pool
+        .multireact remove <@user|uid> <emoji>  — remove from user pool
+        .multireact on  [<@user|uid>]           — enable global or per-user
+        .multireact off [<@user|uid>]           — disable global or per-user
+        .multireact list                        — show all pools
+        .multireact clear [<@user|uid>]         — clear global or user pool
+        """
+        sub = args[1].lower() if len(args) > 1 else ""
+
+        # ── add ──────────────────────────────────────────────────────────────
+        if sub == "add":
+            if len(args) < 3:
+                return await message.edit(content=S.ui_err(
+                    "usage: multireact add <emoji>"
+                    "  |  multireact add <@user|uid> <emoji>"))
+            uid, raw_emoji = _parse_user_and_emoji(args, 2, rc)
+            if raw_emoji is None:
+                return await message.edit(content=S.ui_err(
+                    "couldn't read emoji"))
+            emoji = self._resolve(raw_emoji)
+
+            if uid is not None:
+                pool = self._multireact_users.setdefault(uid, [])
+                if emoji in pool:
+                    return await message.edit(content=S.ui_info(
+                        f"{emoji} already in {self._ulabel(uid)}'s pool"))
+                pool.append(emoji)
+                return await message.edit(content=S.ui_ok(
+                    f"added {emoji} → {self._ulabel(uid)}'s pool  "
+                    f"({len(pool)} total)"))
+            else:
                 if emoji in S._multireact_pool:
-                    return await message.edit(content=S.ui_info("already in pool"))
+                    return await message.edit(content=S.ui_info(
+                        "already in global pool"))
                 S._multireact_pool.append(emoji)
-                await message.edit(
-                    content=S.ui_ok(f"added {emoji}  ({len(S._multireact_pool)} in pool)"))
+                return await message.edit(content=S.ui_ok(
+                    f"added {emoji} → global pool  "
+                    f"({len(S._multireact_pool)} total)"))
 
-            elif sub in ("remove", "rem", "del") and len(args) >= 3:
-                raw   = _parse_emoji_arg(args, 2)
-                emoji = self._resolve(raw)
+        # ── remove ───────────────────────────────────────────────────────────
+        elif sub in ("remove", "rem", "del"):
+            if len(args) < 3:
+                return await message.edit(content=S.ui_err(
+                    "usage: multireact remove <emoji>"
+                    "  |  multireact remove <@user|uid> <emoji>"))
+            uid, raw_emoji = _parse_user_and_emoji(args, 2, rc)
+            if raw_emoji is None:
+                return await message.edit(content=S.ui_err("couldn't read emoji"))
+            emoji = self._resolve(raw_emoji)
+
+            if uid is not None:
+                pool = self._multireact_users.get(uid, [])
+                if emoji not in pool:
+                    return await message.edit(content=S.ui_err(
+                        f"{emoji} not in {self._ulabel(uid)}'s pool"))
+                pool.remove(emoji)
+                return await message.edit(content=S.ui_ok(
+                    f"removed {emoji} from {self._ulabel(uid)}'s pool"))
+            else:
                 if emoji not in S._multireact_pool:
-                    return await message.edit(content=S.ui_err("not in pool"))
+                    return await message.edit(content=S.ui_err(
+                        "not in global pool"))
                 S._multireact_pool.remove(emoji)
-                await message.edit(
-                    content=S.ui_ok(f"removed  ({len(S._multireact_pool)} remaining)"))
+                return await message.edit(content=S.ui_ok(
+                    f"removed {emoji}  ({len(S._multireact_pool)} remaining)"))
 
-            elif sub == "list":
-                rows = [f"  {S.GREY}{i:2}.{S.RESET}  {e}"
-                        for i, e in enumerate(S._multireact_pool, 1)]
-                await message.edit(
-                    content=S.ui_box(
-                        f"multi pool — {'ON' if S._multireact_enabled else 'OFF'}", rows)
-                    if rows else S.ui_info("pool is empty"))
-
-            elif sub in ("on", "enable"):
+        # ── on ───────────────────────────────────────────────────────────────
+        elif sub in ("on", "enable"):
+            uid = _parse_user_id(args[2]) if len(args) > 2 else None
+            if uid is not None:
+                if not self._multireact_users.get(uid):
+                    return await message.edit(content=S.ui_err(
+                        f"no pool for {self._ulabel(uid)} — add emojis first"))
+                self._multireact_users_on[uid] = True
+                return await message.edit(content=S.ui_ok(
+                    f"multireact → on for {self._ulabel(uid)}"))
+            else:
                 if not S._multireact_pool:
-                    return await message.edit(content=S.ui_err("pool is empty — add emojis first"))
+                    return await message.edit(content=S.ui_err(
+                        "global pool is empty — add emojis first"))
                 S._multireact_enabled = True
                 _sync(_multireact_enabled=True)
-                await message.edit(content=S.ui_ok("multireact → enabled"))
+                return await message.edit(content=S.ui_ok(
+                    "multireact → on (global)"))
 
-            elif sub in ("off", "disable"):
+        # ── off ──────────────────────────────────────────────────────────────
+        elif sub in ("off", "disable"):
+            uid = _parse_user_id(args[2]) if len(args) > 2 else None
+            if uid is not None:
+                self._multireact_users_on[uid] = False
+                return await message.edit(content=S.ui_ok(
+                    f"multireact → off for {self._ulabel(uid)}"))
+            else:
                 S._multireact_enabled = False
                 _sync(_multireact_enabled=False)
-                await message.edit(content=S.ui_ok("multireact → disabled"))
+                return await message.edit(content=S.ui_ok(
+                    "multireact → off (global)"))
 
-            elif sub == "clear":
+        # ── list ─────────────────────────────────────────────────────────────
+        elif sub == "list":
+            rows = []
+            g_status = "ON" if S._multireact_enabled else "OFF"
+            if S._multireact_pool:
+                rows.append(f"  {S.DIM}global [{g_status}]{S.RESET}")
+                for i, e in enumerate(S._multireact_pool, 1):
+                    rows.append(f"    {S.GREY}{i}.{S.RESET}  {e}")
+            else:
+                rows.append(f"  {S.DIM}global [{g_status}]{S.RESET}  (empty)")
+            for uid, pool in sorted(self._multireact_users.items()):
+                on = self._multireact_users_on.get(uid, False)
+                rows.append(
+                    f"  {S.GREY}•{S.RESET} {self._ulabel(uid)}  "
+                    f"[{'ON' if on else 'OFF'}]")
+                for i, e in enumerate(pool, 1):
+                    rows.append(f"    {S.GREY}{i}.{S.RESET}  {e}")
+            return await message.edit(
+                content=S.ui_box("multireact pools", rows)
+                if rows else S.ui_info("no pools configured"))
+
+        # ── clear ─────────────────────────────────────────────────────────────
+        elif sub == "clear":
+            uid = _parse_user_id(args[2]) if len(args) > 2 else None
+            if uid is not None:
+                self._multireact_users.pop(uid, None)
+                self._multireact_users_on.pop(uid, None)
+                return await message.edit(content=S.ui_ok(
+                    f"multireact pool cleared for {self._ulabel(uid)}"))
+            else:
                 S._multireact_pool.clear()
                 S._multireact_enabled = False
                 _sync(_multireact_enabled=False)
-                await message.edit(content=S.ui_ok("pool cleared"))
+                return await message.edit(content=S.ui_ok(
+                    "global multireact pool cleared"))
 
-            else:
-                await message.edit(content=S.ui_info(
-                    "usage: multireact add/remove/list/on/off/clear <emoji>\n"
-                    "       emoji can be unicode, :name:, or <:name:id>"))
+        else:
+            await message.edit(content=S.ui_info(
+                "multireact add/remove/on/off/list/clear  <emoji>"
+                "  |  <@user|uid> <emoji>"))
 
-        # ── vsniper ────────────────────────────────────────────────────
-        elif cmd == "vsniper":
-            sub = args[1].lower() if len(args) > 1 else ""
+    # ─────────────────────────────────────────────────────────────────────────
+    # .vsniper
+    # ─────────────────────────────────────────────────────────────────────────
 
-            if sub == "add" and len(args) >= 4:
-                S._vsniper_list.append({"code": args[2], "guild_id": args[3]})
-                await message.edit(content=S.ui_ok(f"watching vanity: {args[2]}"))
+    async def _vsniper(self, message, args):
+        sub = args[1].lower() if len(args) > 1 else ""
 
-            elif sub == "start":
-                if S._vsniper_task and not S._vsniper_task.done():
-                    return await message.edit(content=S.ui_info("already running"))
-                S._vsniper_task = asyncio.create_task(_vsniper_loop())
-                _sync(_vsniper_task=S._vsniper_task)
-                await message.edit(content=S.ui_ok("vsniper → started"))
-
-            elif sub == "stop":
-                if S._vsniper_task:
-                    S._vsniper_task.cancel()
-                    S._vsniper_task = None
-                    _sync(_vsniper_task=None)
-                await message.edit(content=S.ui_ok("vsniper → stopped"))
-
-            elif sub == "list":
-                rows = [
-                    f"  {S.GREY}•{S.RESET} {e['code']}  "
+        if sub == "add" and len(args) >= 4:
+            S._vsniper_list.append({"code": args[2], "guild_id": args[3]})
+            await message.edit(content=S.ui_ok(f"watching: {args[2]}"))
+        elif sub == "start":
+            if S._vsniper_task and not S._vsniper_task.done():
+                return await message.edit(content=S.ui_info("already running"))
+            S._vsniper_task = asyncio.create_task(_vsniper_loop())
+            _sync(_vsniper_task=S._vsniper_task)
+            await message.edit(content=S.ui_ok("vsniper → started"))
+        elif sub == "stop":
+            if S._vsniper_task:
+                S._vsniper_task.cancel()
+                S._vsniper_task = None
+                _sync(_vsniper_task=None)
+            await message.edit(content=S.ui_ok("vsniper → stopped"))
+        elif sub == "list":
+            rows = [f"  {S.GREY}•{S.RESET} {e['code']}  "
                     f"{S.DIM}guild {e['guild_id']}{S.RESET}"
-                    for e in S._vsniper_list
-                ]
-                await message.edit(
-                    content=S._paginate("vsniper", "watch list", rows)
-                    if rows else S.ui_info("watch list is empty"))
+                    for e in S._vsniper_list]
+            await message.edit(
+                content=S._paginate("vsniper", "watch list", rows)
+                if rows else S.ui_info("empty"))
+        else:
+            await message.edit(content=S.ui_info(
+                "vsniper add <code> <guild_id> | start | stop | list"))
 
-            else:
-                await message.edit(
-                    content=S.ui_info("usage: vsniper add <code> <guild_id> | start | stop | list"))
+    # ─────────────────────────────────────────────────────────────────────────
+    # .reactdiag
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _reactdiag(self, message):
+        try:
+            from modifyself.models.message import Message as _M
+            patched = bool(getattr(_M, "_raw_react_patched", False))
+        except ImportError:
+            patched = "import-failed"
+
+        rows = [
+            f"  {S.DIM}patch installed{S.RESET}      {patched}",
+            f"  {S.DIM}global autoreact{S.RESET}     "
+            f"{S._autoreact_emoji or 'off'}",
+            f"  {S.DIM}global superreact{S.RESET}    "
+            f"{S._superreact_emoji or 'off'}",
+            f"  {S.DIM}global multi{S.RESET}         "
+            f"{'ON' if S._multireact_enabled else 'OFF'}  "
+            f"pool={S._multireact_pool}",
+            "",
+            f"  {S.DIM}per-user autoreact{S.RESET}   "
+            f"{len(self._autoreact_users)} target(s)",
+        ]
+        for uid, emoji in sorted(self._autoreact_users.items()):
+            rows.append(f"    {S.GREY}•{S.RESET} <@{uid}>  →  {emoji}")
+
+        rows.append(f"  {S.DIM}per-user superreact{S.RESET}  "
+                    f"{len(self._superreact_users)} target(s)")
+        for uid, emoji in sorted(self._superreact_users.items()):
+            rows.append(f"    {S.GREY}•{S.RESET} <@{uid}>  →  {emoji}")
+
+        rows.append(f"  {S.DIM}per-user multireact{S.RESET}  "
+                    f"{len(self._multireact_users)} pool(s)")
+        for uid, pool in sorted(self._multireact_users.items()):
+            on = self._multireact_users_on.get(uid, False)
+            rows.append(f"    {S.GREY}•{S.RESET} <@{uid}>  "
+                        f"[{'ON' if on else 'OFF'}]  {pool}")
+
+        await message.edit(content=S._ansi_block(rows))

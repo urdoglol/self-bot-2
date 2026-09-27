@@ -8,6 +8,17 @@
 #  [BUG-2] `afkignore` guard was `if len(args) < 3` which blocked `afkignore list`
 #          and `afkignore clear` (both only need 2 tokens).  Changed to `< 2` and
 #          moved the uid-required check inside the add/remove branches.
+#
+#  [BUG-3] afkignore (and afkwhitelist / afkcustom) had a type-mismatch bug:
+#          the commands store plain int IDs (int(args[2])) into the blacklist,
+#          whitelist and custom_replies collections, but _afk_pre_hook looked
+#          them up using message.author.id which is a modifyself Snowflake object.
+#          Snowflake overrides __hash__ to return id >> 22 (the timestamp bucket);
+#          plain int IDs hash differently, so the set/dict membership tests always
+#          evaluated to False — meaning the ignore list was silently never applied
+#          and the AFK reply fired for every ignored user.  Fixed by casting
+#          message.author.id to int at the top of the hook so all lookups use a
+#          consistent type and hash.
 
 import asyncio
 import time
@@ -30,6 +41,14 @@ async def _afk_pre_hook(client, message):
         a["enabled"] = False
         a["emergency"] = False
         return
+    # BUG-3 FIX: normalise message.author.id to a plain int once here.
+    # modifyself's Snowflake.__hash__ returns id >> 22 (timestamp bucket), which
+    # differs from hash(int(id)), so Snowflake(n) in {int(n)} was always False —
+    # the ignore / whitelist / custom_reply lookups silently never matched.
+    try:
+        author_id = int(message.author.id)
+    except Exception:
+        return
     # only react to messages that mention us
     try:
         me = client.user
@@ -38,12 +57,12 @@ async def _afk_pre_hook(client, message):
         mentioned = False
     if not mentioned:
         return
-    if message.author.id == client.user.id:
+    if author_id == int(client.user.id):
         return
-    # ignore list
-    if message.author.id in a["blacklist"]:
+    # ignore list — uses author_id (plain int) so hash matches stored int keys
+    if author_id in a["blacklist"]:
         return
-    if a["whitelist"] and message.author.id not in a["whitelist"]:
+    if a["whitelist"] and author_id not in a["whitelist"]:
         return
     # dm-only
     if a["dm_only"] and getattr(message, "guild", None) is not None:
@@ -54,17 +73,17 @@ async def _afk_pre_hook(client, message):
         msg = a["per_server"][gid].get("message") or a["message"]
     else:
         msg = a["message"]
-    # custom reply per user
-    if message.author.id in a["custom_replies"]:
-        msg = a["custom_replies"][message.author.id]
+    # custom reply per user — same int-key normalisation
+    if author_id in a["custom_replies"]:
+        msg = a["custom_replies"][author_id]
     # cooldown per user
-    key = (message.author.id, getattr(message, "channel_id", 0))
+    key = (author_id, getattr(message, "channel_id", 0))
     last = a["last_reply"].get(key, 0)
     if time.time() - last < a["cooldown"]:
         return
     a["last_reply"][key] = time.time()
     # ping counter
-    a["ping_counter"][message.author.id] = a["ping_counter"].get(message.author.id, 0) + 1
+    a["ping_counter"][author_id] = a["ping_counter"].get(author_id, 0) + 1
     try:
         await message.reply(msg, mention_author=False)
     except Exception:
