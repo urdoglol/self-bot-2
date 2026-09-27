@@ -1,4 +1,10 @@
 # cogs/sniper.py | full delete/edit snipe suite — search, filters, stats, pagination
+#
+# FIXES:
+#  [BUG-1] record_delete called a.get('url') on attachment objects.  Attachment
+#          objects are discord.Attachment instances, not dicts, so .get() raised
+#          AttributeError.  Changed to getattr() with a dict fallback so both
+#          object and dict representations are handled safely.
 import asyncio
 import time
 from datetime import datetime
@@ -375,7 +381,11 @@ def record_delete(message):
     entry = {
         "author": str(message.author), "author_id": message.author.id,
         "content": message.content or "",
-        "attachments": [a.get("url") for a in (message.attachments or [])],
+        # BUG-1 FIX: attachments are objects not dicts — use getattr, not .get()
+        "attachments": [
+            getattr(a, "url", None) or (a.get("url") if isinstance(a, dict) else str(a))
+            for a in (message.attachments or [])
+        ],
         "embeds": [dict(e.to_dict()) if hasattr(e, "to_dict") else {} for e in (message.embeds or [])],
         "reactions": [str(r.emoji) for r in (getattr(message, "reactions", []) or [])],
         "time": datetime.now().strftime("%H:%M:%S"),

@@ -1,4 +1,9 @@
 # cogs/settings.py | prefix, aliases, cooldowns, profiles, config import/export, encrypt, enable/disable
+#
+# FIXES:
+#  [BUG-1] _config export wrote to "exports/" without ensuring the directory
+#          existed first, raising FileNotFoundError on a fresh install.
+
 import os
 import sys
 import json
@@ -151,6 +156,8 @@ class SettingsCog:
     async def _config(self, message, args):
         sub = args[1].lower() if len(args) > 1 else ""
         if sub == "export":
+            # BUG-1 FIX: ensure the exports directory exists before writing
+            os.makedirs("exports", exist_ok=True)
             p = f"exports/config_{int(time.time())}.json"
             with open(p, "w") as f: json.dump(S.load_config() or {}, f, indent=2)
             await message.edit(content=S.ui_ok(f"→ {p}"))

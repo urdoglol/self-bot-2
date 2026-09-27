@@ -1,4 +1,9 @@
 # cogs/webhooks.py | create/delete/list/spam/rename/clear, emoji list + steal
+#
+# FIXES:
+#  [BUG-1] webhook clear iterated message.guild.channels without first checking
+#          that message.guild is not None.  Running this in a DM raised
+#          AttributeError: 'NoneType' object has no attribute 'channels'.
 import asyncio
 import re
 import aiohttp
@@ -122,6 +127,10 @@ class WebhooksCog:
                 await message.channel.send(S.ui_err(str(e)), delete_after=5)
 
         elif sub == "clear":
+            # BUG-1 FIX: guard against running in a DM where guild is None
+            if not message.guild:
+                return await message.channel.send(
+                    S.ui_err("server only"), delete_after=5)
             n = 0
             for ch in message.guild.channels:
                 try:

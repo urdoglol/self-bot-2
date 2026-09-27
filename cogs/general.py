@@ -1,5 +1,12 @@
 # cogs/general.py | ping, info, say, spam, purge, snipe (extended), editsnipe, copycat,
 #                   status, hypesquad, sniper, logger, readlog, ar
+#
+# FIXES:
+#  [BUG-1] `copycat` check function referenced `m.channel_id` directly.  Not all
+#          message objects in selfbot shims expose `channel_id` as a flat attribute;
+#          some only expose it through `m.channel.id`.  Changed to try `channel_id`
+#          first and fall back to `m.channel.id`.
+
 import asyncio
 import sys
 import os
@@ -255,8 +262,13 @@ class GeneralCog:
                 return await message.edit(content=S.ui_err("invalid user id"))
             try: await message.delete()
             except Exception: pass
+            # BUG-1 FIX: use getattr fallback so both channel_id and channel.id work
+            target_cid = message.channel.id
             def check(m):
-                return m.author.id == uid and m.channel_id == message.channel.id
+                m_cid = getattr(m, "channel_id", None)
+                if m_cid is None:
+                    m_cid = getattr(getattr(m, "channel", None), "id", None)
+                return m.author.id == uid and m_cid == target_cid
             for _ in range(10):
                 try:
                     m = await client.wait_for("message", check=check, timeout=60)

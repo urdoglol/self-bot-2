@@ -1,11 +1,20 @@
 # cogs/quest.py
 # ported to modifyself HTTPClient + HeaderSpoofer (TLS-consistent)
+#
+# FIXES:
+#  [BUG-1] Both _ForkTransport.request and _AiohttpTransport.request used
+#          `json` as a parameter name, which shadows the standard-library
+#          `json` module inside those functions.  Any call to json.loads()
+#          or json.dumps() inside the method therefore raised AttributeError
+#          (e.g. `NoneType has no attribute 'loads'`).  Renamed the parameter
+#          to `payload` throughout both classes and updated all internal uses.
 
 import discord
 from discord.ext import commands
 import asyncio
 import logging
 import json
+import json as _json  # alias to survive parameter shadowing (BUG-1 FIX)
 import random
 import math
 import time
@@ -77,7 +86,7 @@ class _ForkTransport:
         print(f"[quest] fork HTTPClient: {type(self._client).__module__}."
               f"{type(self._client).__name__}")
 
-    async def request(self, method, url, headers=None, json=None, params=None):
+    async def request(self, method, url, headers=None, payload=None, params=None):  # BUG-1 FIX: was json=
         path = url
         for prefix in ("https://discord.com/api/v10",
                        "https://discord.com/api/v9",
@@ -94,9 +103,9 @@ class _ForkTransport:
         for attempt in range(3):
             try:
                 if params:
-                    call = self._client.request(route, json=json, params=params)
+                    call = self._client.request(route, json=payload, params=params)
                 else:
-                    call = self._client.request(route, json=json)
+                    call = self._client.request(route, json=payload)
                 if asyncio.iscoroutine(call):
                     call = await call
                 body = call if isinstance(call, dict) else {}
@@ -109,7 +118,7 @@ class _ForkTransport:
                         or "bytes | bytearray" in msg
                         or "not an instance of 'bytes" in msg):
                     try:
-                        body_bytes = json.dumps(json or {}).encode("utf-8")
+                        body_bytes = _json.dumps(payload or {}).encode("utf-8")
                         base_headers = self._spoofer.get_headers()
                         if headers:
                             base_headers.update(headers)
@@ -166,16 +175,16 @@ class _AiohttpTransport:
             timeout = aiohttp.ClientTimeout(total=30, connect=10)
             self._session = aiohttp.ClientSession(timeout=timeout)
 
-    async def request(self, method, url, headers=None, json=None, params=None):
+    async def request(self, method, url, headers=None, payload=None, params=None):  # BUG-1 FIX: was json=
         await self._ensure()
         merged = self._headers()
         if headers:
             merged.update(headers)
         async with self._session.request(method, url, headers=merged,
-                                         json=json, params=params) as r:
+                                         json=payload, params=params) as r:
             text = await r.text()
             try:
-                body = json.loads(text)
+                body = _json.loads(text)  # BUG-1 FIX: was json.loads (shadowed param)
             except Exception:
                 body = {}
             return r.status, body

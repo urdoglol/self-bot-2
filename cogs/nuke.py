@@ -1,4 +1,9 @@
 # cogs/nuke.py | destructive server ops + backup/restore bridge
+#
+# FIXES:
+#  [BUG-1] _backup_server wrote to "backups/" without ensuring the directory
+#          exists first, raising FileNotFoundError on a fresh install.
+
 import os
 import time
 import json
@@ -11,6 +16,8 @@ def json_dump(path, data):
 
 
 async def _backup_server(guild):
+    # BUG-1 FIX: ensure the backups directory exists before writing
+    os.makedirs("backups", exist_ok=True)
     data = {"id": str(guild.id), "name": guild.name,
             "icon": str(guild.icon) if guild.icon else None,
             "roles": [{"id": str(r.id), "name": r.name, "color": r.color.value,

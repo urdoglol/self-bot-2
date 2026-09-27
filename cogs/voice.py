@@ -1,4 +1,12 @@
 # cogs/voice.py | vc join/leave/move/self-controls + auto-reconnect watchdog + 24/7 keep
+#
+# FIXES:
+#  [BUG-1] selfmute / selfdeaf / selfstream / selfcamera toggled only the one
+#          flag via **{key: new_val}, leaving all other VC state params at their
+#          function defaults (False).  If you were deafened and toggled mute, the
+#          op:4 payload sent self_deaf=False, silently undeafening you.  Fixed by
+#          building the full kwargs dict from _self_vc first, then overriding the
+#          single key being toggled.
 import asyncio
 import json
 import time
@@ -451,7 +459,16 @@ class VoiceCog:
             key = key_map[cmd]
             new_val = not _self_vc.get(key, False)
             try:
-                await _send_vc(client, gid, ch_id, **{key: new_val})
+                # BUG-1 FIX: preserve all current VC flags; only override
+                # the single key being toggled so unrelated flags don't reset.
+                vc_kwargs = {
+                    "self_mute":   _self_vc.get("self_mute",  False),
+                    "self_deaf":   _self_vc.get("self_deaf",  False),
+                    "self_video":  _self_vc.get("self_video", False),
+                    "self_stream": _self_vc.get("self_stream",False),
+                }
+                vc_kwargs[key] = new_val
+                await _send_vc(client, gid, ch_id, **vc_kwargs)
                 _self_vc[key] = new_val
                 await message.channel.send(
                     S.ui_ok(f"{cmd} → {'on' if new_val else 'off'}"),

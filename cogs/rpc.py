@@ -1,4 +1,11 @@
 # cogs/rpc.py
+#
+# FIXES:
+#  [BUG-1] build_spotify / build_youtube / build_crunchyroll all computed
+#          the "end" timestamp as start + (total_ms - current_ms) instead of
+#          start + total_ms.  When current_ms > 0 this made the media bar
+#          show too short a remaining duration (off by current_ms ms).
+#          Correct formula: end = (now - current_ms) + total_ms.
 import modifyself_shim as discord
 import asyncio
 import time
@@ -948,7 +955,7 @@ class RPCCog:
         return {
             "type": 2, "name": "Spotify", "details": song, "state": artist,
             "timestamps": {"start": now - current_ms,
-                           "end": (now - current_ms) + (total_ms - current_ms)},
+                           "end": (now - current_ms) + total_ms  # BUG-1 FIX: was (total_ms - current_ms)},
             "application_id": "3201606009684", "sync_id": sid,
             "session_id": f"spotify:{sid}",
             "party": {"id": f"spotify:{sid}", "size": [1, 1]},
@@ -973,7 +980,7 @@ class RPCCog:
         return {
             "type": 3, "name": "YouTube", "details": video, "state": channel,
             "timestamps": {"start": now - current_ms,
-                           "end": (now - current_ms) + (total_ms - current_ms)},
+                           "end": (now - current_ms) + total_ms  # BUG-1 FIX: was (total_ms - current_ms)},
             "application_id": "111299001912",
             "assets": {"large_image": "youtube", "large_text": f"{video} on YouTube"}
         }
@@ -1018,7 +1025,7 @@ class RPCCog:
             "type": 3, "name": "Crunchyroll", "application_id": "981509069309354054",
             "details": anime, "state": episode,
             "timestamps": {"start": now - current_ms,
-                           "end": (now - current_ms) + (total_ms - current_ms)},
+                           "end": (now - current_ms) + total_ms  # BUG-1 FIX: was (total_ms - current_ms)},
             "assets": {"large_image": "crunchyroll", "large_text": anime[:32]}
         }
 

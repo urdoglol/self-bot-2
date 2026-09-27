@@ -1,4 +1,14 @@
 # cogs/afk.py | full AFK system — whitelist, blacklist, cooldown, dm-only, per-server, expiry, emergency
+#
+# FIXES:
+#  [BUG-1] Emergency mode hook just returned without deactivating AFK.  When the
+#          selfbot owner sends any message in emergency mode, AFK should turn off
+#          and emergency should be cleared before returning.
+#
+#  [BUG-2] `afkignore` guard was `if len(args) < 3` which blocked `afkignore list`
+#          and `afkignore clear` (both only need 2 tokens).  Changed to `< 2` and
+#          moved the uid-required check inside the add/remove branches.
+
 import asyncio
 import time
 import modifyself_shim as discord
@@ -15,8 +25,10 @@ async def _afk_pre_hook(client, message):
         a["enabled"] = False
         a["expires_at"] = 0.0
         return
-    # emergency mode: exit on any message from user
+    # BUG-1 FIX: emergency mode — deactivate AFK when the owner sends a message
     if a["emergency"] and message.author.id == client.user.id:
+        a["enabled"] = False
+        a["emergency"] = False
         return
     # only react to messages that mention us
     try:
@@ -105,13 +117,19 @@ class AfkCog:
             await message.edit(content=S.ui_box("AFK status", rows))
 
         elif cmd == "afkignore":
-            if len(args) < 3:
-                return await message.edit(content=S.ui_err("usage: afkignore add/remove/list <uid>"))
+            # BUG-2 FIX: only need 1 sub-arg (the sub-command itself).
+            # add/remove additionally need a uid.
+            if len(args) < 2:
+                return await message.edit(content=S.ui_err(
+                    "usage: afkignore add/remove/list/clear <uid>"))
             sub = args[1].lower()
-            if sub == "add" and args[2].isdigit():
+            if sub in ("add", "remove") and (len(args) < 3 or not args[2].isdigit()):
+                return await message.edit(content=S.ui_err(
+                    f"usage: afkignore {sub} <uid>"))
+            if sub == "add":
                 a["blacklist"].add(int(args[2]))
                 await message.edit(content=S.ui_ok(f"ignoring {args[2]}"))
-            elif sub == "remove" and args[2].isdigit():
+            elif sub == "remove":
                 a["blacklist"].discard(int(args[2]))
                 await message.edit(content=S.ui_ok("removed"))
             elif sub == "list":

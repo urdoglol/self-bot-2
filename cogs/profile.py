@@ -1,6 +1,12 @@
 # cogs/profile.py | setpfp, setbio, setbanner, myprofile, accountbackup
+#
+# FIXES:
+#  [BUG-1] accountbackup wrote to "backups/" without ensuring the directory
+#          exists first, raising FileNotFoundError on a fresh install.
+
 import base64
 import json
+import os
 from datetime import datetime
 import aiohttp
 import modifyself_shim as discord
@@ -111,6 +117,8 @@ class ProfileCog:
             backup = {"profile": profile, "relationships": rels,
                       "guilds": [{"id": str(g.id), "name": g.name} for g in client.guilds],
                       "timestamp": datetime.now().isoformat()}
+            # BUG-1 FIX: ensure the backups directory exists before writing
+            os.makedirs("backups", exist_ok=True)
             fname = f"backups/account_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             with open(fname, "w") as f:
                 json.dump(backup, f, indent=2)

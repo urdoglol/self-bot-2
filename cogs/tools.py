@@ -1,4 +1,8 @@
 # cogs/tools.py | nitro gen, applybypass, tokeninfo, calculate, fact, fetchlyrics, robuxtax, archivechannel
+#
+# FIXES:
+#  [BUG-1] archivechannel wrote to exports/ without first ensuring the directory
+#          exists, raising FileNotFoundError on a fresh install.
 import base64
 import random
 import re
@@ -143,6 +147,8 @@ class ToolsCog:
                 ts = msg.timestamp.strftime('%Y-%m-%d %H:%M:%S') if hasattr(msg.timestamp, 'strftime') else str(msg.timestamp)
                 out.append(f"[{ts}] {msg.author}: {msg.content}")
                 count += 1
+            # BUG-1 FIX: ensure exports directory exists before writing
+            import os; os.makedirs("exports", exist_ok=True)
             fname = f"exports/archive_{ch.id}.txt"
             with open(fname, "w", encoding="utf-8") as f:
                 f.write("\n".join(reversed(out)))

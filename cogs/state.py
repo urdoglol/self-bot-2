@@ -1,4 +1,9 @@
 # cogs/state.py | shared state for all cogs
+#
+# FIXES:
+#  [BUG-1] _perm_check: if a command had entries in _perm_allow, even the owner
+#          would be blocked from it if their uid wasn't in the allowlist.  Added
+#          an _is_owner() bypass so the owner is never locked out by perm_allow.
 import os
 import re
 import json
@@ -191,7 +196,8 @@ def _perm_check(cmd, message) -> bool:
     if cmd in _perm_channel and message.channel.id != _perm_channel[cmd]: return False
     if cmd in _perm_server and (message.guild is None or message.guild.id != _perm_server[cmd]): return False
     if cmd in _perm_allow and _perm_allow[cmd]:
-        return message.author.id in _perm_allow[cmd]
+        # BUG-1 FIX: owner must never be locked out by the perm_allow list
+        return message.author.id in _perm_allow[cmd] or _is_owner(message.author.id)
     return True
 
 HOSTED_TOKENS: list = []

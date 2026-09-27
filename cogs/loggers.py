@@ -1,4 +1,20 @@
 # cogs/loggers.py | message / deleted / edited / reaction / mention / dm / join / leave loggers
+#
+# FIXES:
+#  [BUG-1] `_message()` resolved the client via `m._state._get_client()` — an
+#          internal discord.py detail that is not guaranteed to exist on every
+#          message object (especially in selfbot shims).  Changed to use S.CLIENT
+#          directly, which is always set before any events fire.
+#
+#  [BUG-2] `_deleted()` called `a.get("url")` on attachment objects.  Attachments
+#          are discord Attachment instances, not dicts, so `.get()` doesn't exist.
+#          Changed to `getattr(a, "url", str(a))`.
+#
+#  [BUG-3] `handle()` — the `logchannel` branch had no `return` statement, so after
+#          handling that command execution fell through and also matched the
+#          `elif cmd.startswith("log") and cmd[3:] in S.loggers` branch, potentially
+#          double-editing the message.  Added `return` after the logchannel handler.
+
 import time
 from datetime import datetime
 import modifyself_shim as discord
@@ -90,20 +106,21 @@ class LoggersCog:
         g = getattr(m, "guild", None)
         rows = [
             f"  {S.DIM}guild{S.RESET}   {getattr(g, 'name', 'DM')}",
-            f"  {S.DIM}channel{S.RESET} {getattr(m.channel, 'name', str(m.channel_id))}",
+            f"  {S.DIM}channel{S.RESET} {getattr(m.channel, 'name', str(getattr(m, 'channel_id', '?')))}",
             f"  {S.DIM}author{S.RESET}  {m.author}  ({getattr(m.author,'id','?')})",
             f"  {S.DIM}at{S.RESET}      {_fmt_time()}",
             "",
             f"  {S.WHITE}{(m.content or '')[:400]}{S.RESET}",
         ]
-        await _emit(m._state and m._state._get_client() if hasattr(m, "_state") else S.CLIENT,
-                    "message", "message", rows)
+        # BUG-1 FIX: use S.CLIENT directly instead of unreliable m._state._get_client()
+        await _emit(S.CLIENT, "message", "message", rows)
 
     async def _deleted(self, m):
-        atts = [a.get("url") for a in (m.attachments or [])]
+        # BUG-2 FIX: attachments are objects, not dicts — use getattr, not .get()
+        atts = [getattr(a, "url", str(a)) for a in (m.attachments or [])]
         rows = [
             f"  {S.DIM}author{S.RESET}  {m.author}  ({getattr(m.author,'id','?')})",
-            f"  {S.DIM}channel{S.RESET} {getattr(m.channel, 'name', str(m.channel_id))}",
+            f"  {S.DIM}channel{S.RESET} {getattr(m.channel, 'name', str(getattr(m, 'channel_id', '?')))}",
             f"  {S.DIM}at{S.RESET}      {_fmt_time()}",
         ]
         if atts:
@@ -114,7 +131,7 @@ class LoggersCog:
     async def _edited(self, before, after):
         rows = [
             f"  {S.DIM}author{S.RESET}  {before.author}  ({getattr(before.author,'id','?')})",
-            f"  {S.DIM}channel{S.RESET} {getattr(before.channel, 'name', str(before.channel_id))}",
+            f"  {S.DIM}channel{S.RESET} {getattr(before.channel, 'name', str(getattr(before, 'channel_id', '?')))}",
             f"  {S.DIM}at{S.RESET}      {_fmt_time()}",
             "",
             f"  {S.DIM}before{S.RESET}",
@@ -166,7 +183,8 @@ class LoggersCog:
             if kind not in S.loggers:
                 return await message.edit(content=S.ui_err(f"unknown kind: {kind}"))
             S.loggers[kind]["channel"] = args[2]
-            await message.edit(content=S.ui_ok(f"{kind} → {args[2]}"))
+            # BUG-3 FIX: added return so we don't fall through to the log* elif below
+            return await message.edit(content=S.ui_ok(f"{kind} → {args[2]}"))
 
         if cmd == "logstatus":
             rows = [f"  {S.DIM}{k:<10}{S.RESET}  {'ON ' if v['enabled'] else 'off'}  ch {v['channel'] or '—'}"

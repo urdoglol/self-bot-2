@@ -1,4 +1,13 @@
 # cogs/scrape.py | export members/messages/invites, server structure dumps, import
+#
+# FIXES:
+#  [BUG-1] scrape invites called i.get('code') / i.get('uses') on discord Invite
+#          objects (not dicts), causing an AttributeError.  Changed to use
+#          getattr() so both dict and object forms work.
+#
+#  [BUG-2] export invites passed raw Invite objects to json.dump(), which are
+#          not JSON-serialisable.  They are now serialised to plain dicts first.
+
 import os
 import json
 import time
@@ -12,8 +21,22 @@ async def _dump_server(guild):
     p = f"exports/server_{guild.id}_{int(time.time())}.json"
     data_path = await _backup_server(guild)
     with open(data_path) as f: data = json.load(f)
+    os.makedirs("exports", exist_ok=True)
     with open(p, "w") as f: json.dump(data, f, indent=2)
     return p
+
+
+def _invite_to_dict(i):
+    """Safely convert an Invite object or dict to a JSON-serialisable dict."""
+    if isinstance(i, dict):
+        return i
+    return {
+        "code":    getattr(i, "code",    str(i)),
+        "uses":    getattr(i, "uses",    None),
+        "max_uses": getattr(i, "max_uses", None),
+        "url":     getattr(i, "url",     None),
+        "inviter": str(getattr(i, "inviter", "?")),
+    }
 
 
 class ScrapeCog:
@@ -33,8 +56,15 @@ class ScrapeCog:
             elif sub == "invites" and message.guild:
                 try:
                     invs = await message.guild.invites()
-                    rows = [f"  {S.GREY}•{S.RESET} {i.get('code')}  {S.DIM}uses={i.get('uses')}{S.RESET}"
-                            for i in invs]
+                    # BUG-1 FIX: use getattr/dict-safe access on Invite objects
+                    rows = [
+                        f"  {S.GREY}•{S.RESET} "
+                        f"{getattr(i, 'code', i.get('code', '?') if isinstance(i, dict) else '?')}  "
+                        f"{S.DIM}uses="
+                        f"{getattr(i, 'uses', i.get('uses', '?') if isinstance(i, dict) else '?')}"
+                        f"{S.RESET}"
+                        for i in invs
+                    ]
                     await message.channel.send(
                         S._paginate("invites", message.guild.name, rows) if rows else S.ui_info("none"))
                 except Exception as e:
@@ -48,6 +78,7 @@ class ScrapeCog:
                 async for m in ch.history(limit=n):
                     out.append({"author": str(m.author), "id": m.id, "content": m.content,
                                 "ts": m.timestamp.isoformat() if hasattr(m.timestamp, "isoformat") else str(m.timestamp)})
+                os.makedirs("exports", exist_ok=True)
                 p = f"exports/channel_{ch.id}_{int(time.time())}.json"
                 with open(p, "w") as f: json.dump(out, f, indent=2)
                 await message.channel.send(S.ui_ok(f"exported {len(out)} → {p}"))
@@ -59,6 +90,7 @@ class ScrapeCog:
 
         elif cmd == "export":
             sub = args[1].lower() if len(args) > 1 else ""
+            os.makedirs("exports", exist_ok=True)
             if sub == "members" and len(args) >= 3:
                 g = client.get_guild(int(args[2]))
                 if not g:
@@ -88,8 +120,9 @@ class ScrapeCog:
                     return await message.channel.send(S.ui_err("guild not found"), delete_after=5)
                 invs = await g.invites()
                 p = f"exports/invites_{g.id}_{int(time.time())}.json"
+                # BUG-2 FIX: convert Invite objects to dicts before JSON serialisation
                 with open(p, "w") as f:
-                    json.dump(invs, f, indent=2, default=str)
+                    json.dump([_invite_to_dict(i) for i in invs], f, indent=2)
                 await message.channel.send(S.ui_ok(f"exported {len(invs)} → {p}"))
             else:
                 await message.channel.send(S.ui_info("usage: export members/messages/invites"))

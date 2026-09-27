@@ -1,4 +1,10 @@
 # cogs/server.py | serverinfo, members, channels, roles, ban/kick/mute, setnick, topic, slowmode, icon/banner/name
+#
+# FIXES:
+#  [BUG-1] mute/unmute called member.timeout() without checking if
+#          g.get_member() returned None, causing an AttributeError when the
+#          target isn't in the member cache.  Added an explicit None guard.
+
 import aiohttp
 from datetime import timedelta
 import modifyself_shim as discord
@@ -69,13 +75,20 @@ class ServerCog:
             if not g or len(args) < 2:
                 return await message.edit(content=S.ui_err(f"usage: {cmd} <user_id>"))
             try:
+                # BUG-1 FIX: guard against None member before calling timeout()
                 member = g.get_member(int(args[1]))
-                if cmd == "ban": await g.ban(int(args[1]))
-                elif cmd == "kick": await g.kick(int(args[1]))
+                if cmd == "ban":
+                    await g.ban(int(args[1]))
+                elif cmd == "kick":
+                    await g.kick(int(args[1]))
                 elif cmd == "mute":
+                    if member is None:
+                        return await message.edit(content=S.ui_err("member not in cache"))
                     until = discord.utils.utcnow() + timedelta(minutes=10)
                     await member.timeout(until)
                 elif cmd == "unmute":
+                    if member is None:
+                        return await message.edit(content=S.ui_err("member not in cache"))
                     await member.timeout(None)
                 await message.edit(content=S.ui_ok(f"{cmd} → {args[1]}"))
             except Exception as e:
