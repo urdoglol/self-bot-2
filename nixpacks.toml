@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["python310", "chromium", "git"]
+nixPkgs = ["python311", "ffmpeg", "git"]
 aptPkgs = [
   "libxcb1",
   "libxcb-dri3-0",
@@ -25,8 +25,7 @@ aptPkgs = [
 
 [phases.install]
 cmds = [
-  "pip install -r requirements.txt",
-  "playwright install chromium --with-deps"
+  "pip install -r requirements.txt"
 ]
 
 [start]
