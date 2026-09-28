@@ -9,8 +9,6 @@
 #          (e.g. `NoneType has no attribute 'loads'`).  Renamed the parameter
 #          to `payload` throughout both classes and updated all internal uses.
 
-import discord
-from discord.ext import commands
 import asyncio
 import logging
 import json
@@ -334,9 +332,9 @@ async def autoclaim_loop():
 # ============================================================
 # cog
 # ============================================================
-class QuestsCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
+class QuestsCog:
+    def __init__(self):
+        self.bot = None  # set after init if needed; use S.TOKEN for auth
         self.quests = {}
         self.auto_complete = False
         self.last_fetch_time = 0
@@ -403,7 +401,7 @@ class QuestsCog(commands.Cog):
         async with self._transport_lock:
             if self._transport is not None:
                 return self._transport
-            token = _resolve_token(self.bot)
+            token = S.TOKEN or _resolve_token(self.bot)
             if not token:
                 logger.error("[quest] cannot resolve token from bot")
                 return None
@@ -783,161 +781,299 @@ class QuestsCog(commands.Cog):
         self.quest_completion_task = None
         return False
 
-    # --------------------------------------------------------
-    # commands
-    # --------------------------------------------------------
-    @commands.command(aliases=['qlist', 'ql'])
-    async def questlist(self, ctx):
+    # ──────────────────────────────────────────────────────────
+    # modifyself dispatch — COMMANDS + handle()
+    # ──────────────────────────────────────────────────────────
+    COMMANDS = {
+        "quest", "questlist", "ql",
+        "queststart", "qs",
+        "queststop", "qstop", "qx",
+        "questrefresh", "qrefresh", "qr",
+        "questall",
+        "autoquest", "autoclaim",
+        "orbbadge",
+        "questdump", "qdump",
+        "questdiag", "qdiag",
+        "qtransport",
+        "spdecode",
+    }
+
+    def _send(self, content: str) -> str:
+        """Wrap content in an ANSI code block."""
         try:
-            await ctx.message.delete()
+            return S._ansi_block(content.splitlines())
         except Exception:
-            pass
+            return f"```\n{content}\n```"
 
+    async def handle(self, message, cmd, args):
+        if cmd in ("quest", "questlist", "ql"):
+            await self._cmd_quest(message)
+        elif cmd in ("queststart", "qs"):
+            await self._cmd_queststart(message)
+        elif cmd in ("queststop", "qstop", "qx"):
+            await self._cmd_queststop(message)
+        elif cmd in ("questrefresh", "qrefresh", "qr"):
+            await self._cmd_questrefresh(message)
+        elif cmd == "questall":
+            await self._cmd_questall(message)
+        elif cmd == "autoquest":
+            await self._cmd_autoquest(message, args)
+        elif cmd == "autoclaim":
+            await self._cmd_autoclaim(message, args)
+        elif cmd == "orbbadge":
+            await self._cmd_orbbadge(message)
+        elif cmd in ("questdump", "qdump"):
+            await self._cmd_questdump(message, args)
+        elif cmd in ("questdiag", "qdiag"):
+            await self._cmd_questdiag(message)
+        elif cmd == "qtransport":
+            await self._cmd_qtransport(message)
+        elif cmd == "spdecode":
+            await self._cmd_spdecode(message, args)
+
+    # ── quest / questlist / ql ────────────────────────────────
+    async def _cmd_quest(self, message):
+        try: await message.delete()
+        except Exception: pass
         await self.get_quests()
-
         if not self.quests:
-            await ctx.send(ascii.warning("No quests available"))
-            return
+            return await message.channel.send(S.ui_warn("No quests available"))
 
-        active_quests = []
-        in_progress_quests = []
-        completed_quests = []
-        expired_quests = []
-        upcoming_quests = []
-
-        current_time = datetime.now().astimezone()
-
-        for quest_id, quest in self.quests.items():
+        active, in_prog, completed, expired, upcoming = [], [], [], [], []
+        now = datetime.now().astimezone()
+        for qid, quest in self.quests.items():
             if quest.starts_at:
                 try:
-                    start_time = datetime.fromisoformat(quest.starts_at.replace('Z', '+00:00'))
-                    if start_time > current_time:
-                        upcoming_quests.append(quest)
-                        continue
-                except Exception:
-                    pass
-
-            if quest.is_expired:
-                expired_quests.append(quest)
-            elif quest.status == "completed":
-                completed_quests.append(quest)
-            elif quest.status == "enrolled":
-                in_progress_quests.append(quest)
-            else:
-                active_quests.append(quest)
+                    start = datetime.fromisoformat(quest.starts_at.replace("Z", "+00:00"))
+                    if start > now:
+                        upcoming.append(quest); continue
+                except Exception: pass
+            if quest.is_expired:          expired.append(quest)
+            elif quest.status == "completed":   completed.append(quest)
+            elif quest.status == "enrolled":    in_prog.append(quest)
+            else:                          active.append(quest)
 
         lines = [
-            "Quest Status",
-            "???????????",
-            "",
-            f"Auto-completer: {'Running' if self.auto_complete else 'Stopped'}",
-            f"Total Quests: {len(self.quests)}",
-            f"Available: {len(active_quests)}",
-            f"In Progress: {len(in_progress_quests)}",
-            f"Completed: {len(completed_quests)}",
-            f"Expired: {len(expired_quests)}",
+            "Quest Status", "━━━━━━━━━━━━",
+            f"  Auto-completer: {'Running' if self.auto_complete else 'Stopped'}",
+            f"  Total: {len(self.quests)}  Available: {len(active)}  "
+            f"In-progress: {len(in_prog)}  Completed: {len(completed)}",
             "",
         ]
-
-        if in_progress_quests:
-            lines.append("In Progress Quests:")
-            for quest in in_progress_quests:
-                target = quest.target or 30.0
-                pct = 0
-                if target:
-                    pct = max(0, min(100, int((quest.progress / target) * 100)))
-                lines.append(f"  {quest.title} [{quest.task_type}] "
-                             f"({quest.progress:.0f}/{target:.0f} — {pct}%)")
+        if in_prog:
+            lines.append("In Progress:")
+            for q in in_prog:
+                tgt = q.target or 30.0
+                pct = max(0, min(100, int((q.progress / tgt) * 100))) if tgt else 0
+                lines.append(f"  [{q.task_type}] {q.title}  "
+                             f"{q.progress:.0f}/{tgt:.0f}s  ({pct}%)")
             lines.append("")
-
-        if active_quests:
-            lines.append("Available Quests:")
-            for quest in active_quests:
-                lines.append(f"  {quest.title} [{quest.task_type}]")
+        if active:
+            lines.append("Available:")
+            for q in active:
+                lines.append(f"  [{q.task_type}] {q.title}")
             lines.append("")
-
-        if upcoming_quests:
-            lines.append("Upcoming Quests:")
-            for quest in upcoming_quests:
-                lines.append(f"  {quest.title} [{quest.task_type}]")
+        if upcoming:
+            lines.append("Upcoming:")
+            for q in upcoming:
+                lines.append(f"  {q.title}")
             lines.append("")
-
-        lines.extend([
+        lines += [
             "Commands:",
-            "  .queststart   - Start auto-completing",
-            "  .queststop    - Stop auto-completing",
-            "  .questrefresh - Refresh quest data",
-        ])
+            f"  {S.PREFIX}queststart   start auto-completer",
+            f"  {S.PREFIX}queststop    stop auto-completer",
+            f"  {S.PREFIX}questrefresh refresh quest data",
+            f"  {S.PREFIX}questall     run all enrolled quests once",
+        ]
+        await message.channel.send(self._send("\n".join(lines)))
 
-        await ctx.send(self._format_response(lines))
-
-    @commands.command(aliases=['qstart', 'qs'])
-    async def queststart(self, ctx):
-        try:
-            await ctx.message.delete()
-        except Exception:
-            pass
-
-        if self.auto_complete and self.quest_completion_task and \
-                not self.quest_completion_task.done():
-            await ctx.send(ascii.warning("Quest auto-completer is already running"))
-            return
-
+    # ── queststart / qs ───────────────────────────────────────
+    async def _cmd_queststart(self, message):
+        try: await message.delete()
+        except Exception: pass
+        if self.auto_complete and self.quest_completion_task                 and not self.quest_completion_task.done():
+            return await message.channel.send(
+                S.ui_warn("Quest auto-completer is already running"))
         await self.get_quests()
-
-        enrolled = []
-        for quest_id, quest in self.quests.items():
-            if quest.status == "completed" or quest.is_expired or not quest.is_supported():
-                continue
-            if quest_id in self.excluded_quests:
-                continue
-            if quest.status == "enrolled":
-                enrolled.append(quest.title)
-
+        enrolled = [q for q in self.quests.values()
+                    if q.status == "enrolled" and not q.is_expired
+                    and q.is_supported() and q.id not in self.excluded_quests]
         if not enrolled:
-            await ctx.send(ascii.warning(
-                "No enrolled quests available. Enroll through Discord first."))
-            return
-
+            return await message.channel.send(
+                S.ui_warn("No enrolled quests — enroll in Discord first"))
         self.auto_complete = True
-        started = self.start_auto_completer()
-        if started:
-            await ctx.send(ascii.success(
-                f"Quest auto-completer started with {len(enrolled)} quests"))
+        if self.start_auto_completer():
+            await message.channel.send(
+                S.ui_ok(f"Quest auto-completer started ({len(enrolled)} enrolled)"))
         else:
             self.auto_complete = False
-            await ctx.send(ascii.error("Failed to start quest auto-completer"))
+            await message.channel.send(S.ui_err("Failed to start quest auto-completer"))
 
-    @commands.command(aliases=['qstop', 'qx'])
-    async def queststop(self, ctx):
-        try:
-            await ctx.message.delete()
-        except Exception:
-            pass
-
+    # ── queststop / qstop / qx ────────────────────────────────
+    async def _cmd_queststop(self, message):
+        try: await message.delete()
+        except Exception: pass
         if not self.auto_complete:
-            await ctx.send(ascii.warning("Quest auto-completer is not running"))
-            return
+            return await message.channel.send(
+                S.ui_warn("Quest auto-completer is not running"))
+        self.stop_auto_completer()
+        await message.channel.send(S.ui_ok("Quest auto-completer stopped"))
 
-        stopped = self.stop_auto_completer()
-        if stopped:
-            await ctx.send(ascii.success("Quest auto-completer stopping"))
+    # ── questrefresh / qrefresh / qr ─────────────────────────
+    async def _cmd_questrefresh(self, message):
+        try: await message.delete()
+        except Exception: pass
+        msg = await message.channel.send(S.ui_info("Refreshing quests…"))
+        ok = await self.get_quests()
+        content = (S.ui_ok(f"Refreshed — {len(self.quests)} quests")
+                   if ok else S.ui_err("Failed to refresh quest data"))
+        try: await msg.edit(content=content)
+        except Exception: await message.channel.send(content)
+
+    # ── questall ──────────────────────────────────────────────
+    async def _cmd_questall(self, message):
+        try: await message.delete()
+        except Exception: pass
+        msg = await message.channel.send(S.ui_info("Fetching & running all enrolled quests…"))
+        await self.get_quests()
+        done = 0
+        for qid, quest in list(self.quests.items()):
+            if quest.status == "completed" or quest.is_expired or not quest.is_supported():
+                continue
+            if qid in self.excluded_quests or quest.status != "enrolled":
+                continue
+            ok = await self.update_quest_progress(qid)
+            if ok: done += 1
+        content = S.ui_ok(f"Done — {done} quest(s) progressed")
+        try: await msg.edit(content=content)
+        except Exception: await message.channel.send(content)
+
+    # ── autoquest ─────────────────────────────────────────────
+    async def _cmd_autoquest(self, message, args):
+        cfg = S.load_config() or {}
+        if len(args) > 1:
+            new_val = args[1].lower() in ("on", "enable", "true", "1")
         else:
-            await ctx.send(ascii.error("Failed to stop quest auto-completer"))
+            new_val = not cfg.get("autoquest_enabled", False)
+        cfg["autoquest_enabled"] = new_val
+        S.save_config(cfg)
+        label = "enabled" if new_val else "disabled"
+        await message.edit(content=S.ui_ok(f"Autoquest {label}"))
+        if new_val and (not self.quest_completion_task
+                        or self.quest_completion_task.done()):
+            self.auto_complete = True
+            self.start_auto_completer()
 
-    @commands.command(aliases=['qrefresh', 'qr'])
-    async def questrefresh(self, ctx):
+    # ── autoclaim ─────────────────────────────────────────────
+    async def _cmd_autoclaim(self, message, args):
+        cfg = S.load_config() or {}
+        sub = args[1].lower() if len(args) > 1 else ""
+        if sub == "run":
+            await message.edit(content=S.ui_info("Claim sweep…"))
+            n = sum(1 for q in self.quests.values() if q.status == "completed")
+            return await message.edit(content=S.ui_ok(f"Sweep done — {n} completed"))
+        new_val = (sub in ("on", "enable", "true", "1")
+                   if sub else not cfg.get("autoclaim_enabled", False))
+        cfg["autoclaim_enabled"] = new_val
+        S.save_config(cfg)
+        await message.edit(content=S.ui_ok(f"Autoclaim {'enabled' if new_val else 'disabled'}"))
+
+    # ── orbbadge ─────────────────────────────────────────────
+    async def _cmd_orbbadge(self, message):
+        try: await message.delete()
+        except Exception: pass
+        tr = await self._get_transport()
+        if not tr:
+            return await message.channel.send(S.ui_err("No transport available"))
+        done = 0
+        for qid, quest in self.quests.items():
+            if quest.status != "completed":
+                continue
+            try:
+                s, _ = await tr.request(
+                    "POST", f"https://discord.com/api/v9/quests/{qid}/claim-reward",
+                    payload={})
+                if s in (200, 201, 204):
+                    done += 1
+            except Exception:
+                pass
+        await message.channel.send(
+            S.ui_ok(f"Claimed {done} reward(s)")
+            if done else S.ui_info("No completed quests to claim (may be auto-granted)"))
+
+    # ── questdump / qdump ─────────────────────────────────────
+    async def _cmd_questdump(self, message, args):
+        try: await message.delete()
+        except Exception: pass
+        if not self.quests:
+            return await message.channel.send(S.ui_warn("No quests cached"))
+        quests_list = list(self.quests.values())
         try:
-            await ctx.message.delete()
+            idx = max(0, min(int(args[1]) - 1, len(quests_list) - 1))                   if len(args) > 1 and args[1].isdigit() else 0
         except Exception:
-            pass
+            idx = 0
+        q = quests_list[idx]
+        tgt = q.target or 0
+        pct = max(0, min(100, int((q.progress / tgt) * 100))) if tgt else 0
+        lines = [
+            f"Quest Dump #{idx+1}/{len(quests_list)}: {q.title}",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"  id:         {q.id}",
+            f"  task_type:  {q.task_type}",
+            f"  status:     {q.status}",
+            f"  progress:   {q.progress:.0f} / {tgt:.0f}s  ({pct}%)",
+            f"  is_expired: {q.is_expired}",
+            f"  supported:  {q.is_supported()}",
+            f"  expires:    {q.expires_at or 'none'}",
+            f"  enrolled:   {q.enrolled_at or 'none'}",
+        ]
+        await message.channel.send(self._send("\n".join(lines)))
 
-        success = await self.get_quests()
-        if success:
-            await ctx.send(ascii.success("Quest data refreshed successfully"))
-        else:
-            await ctx.send(ascii.error("Failed to refresh quest data"))
+    # ── questdiag / qdiag ────────────────────────────────────
+    async def _cmd_questdiag(self, message):
+        try: await message.delete()
+        except Exception: pass
+        tr_ok = self._transport is not None
+        lines = [
+            "Quest Diagnostics", "━━━━━━━━━━━━━━━━━",
+            f"  token:       {'set' if S.TOKEN else 'MISSING'}",
+            f"  transport:   {'active' if tr_ok else 'not initialised'}",
+            f"  auto:        {'running' if self.auto_complete else 'idle'}",
+            f"  task:        {'alive' if self.quest_completion_task and not self.quest_completion_task.done() else 'done/none'}",
+            f"  quests:      {len(self.quests)} cached",
+            f"  excluded:    {len(self.excluded_quests)}",
+            f"  last fetch:  {int(time.time() - self.last_fetch_time)}s ago"
+                            if self.last_fetch_time else "  last fetch:  never",
+        ]
+        await message.channel.send(self._send("\n".join(lines)))
 
+    # ── qtransport ───────────────────────────────────────────
+    async def _cmd_qtransport(self, message):
+        try: await message.delete()
+        except Exception: pass
+        tr = await self._get_transport()
+        lines = [
+            "Transport", "━━━━━━━━━",
+            f"  active:  {tr is not None}",
+            f"  type:    {'aiohttp (modifyself edition)' if tr else 'none'}",
+            f"  token:   {'set' if S.TOKEN else 'missing'}",
+        ]
+        await message.channel.send(self._send("\n".join(lines)))
 
-async def setup(bot):
-    await bot.add_cog(QuestManager(bot))
+    # ── spdecode ─────────────────────────────────────────────
+    async def _cmd_spdecode(self, message, args):
+        try: await message.delete()
+        except Exception: pass
+        if len(args) < 2:
+            return await message.channel.send(
+                S.ui_err("usage: spdecode <base64>"))
+        import base64 as _b64, json as _json
+        try:
+            raw = args[1] + "=" * (-len(args[1]) % 4)
+            obj = _json.loads(_b64.b64decode(raw).decode("utf-8"))
+            lines = ["Super Properties", "━━━━━━━━━━━━━━━━"]
+            for k, v in obj.items():
+                lines.append(f"  {k}: {v}")
+            await message.channel.send(self._send("\n".join(lines)))
+        except Exception as e:
+            await message.channel.send(S.ui_err(f"Decode failed: {e}"))
