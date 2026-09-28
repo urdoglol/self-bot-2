@@ -1,11 +1,4 @@
 # cogs/triggers.py | message / reaction / voice / member triggers + fired counts
-#
-# FIXES:
-#  [BUG-1] register() wired up on_reaction_add, on_voice_state_update,
-#          on_member_join, and on_member_remove, but never registered an
-#          on_message handler.  Message triggers were therefore completely
-#          non-functional — they could be added/removed/listed but would
-#          never actually fire.  Added on_message + _on_message_event().
 import json
 import os
 import modifyself_shim as discord
@@ -35,11 +28,6 @@ class TriggersCog:
     def register(self, client):
         cog = self
 
-        # BUG-1 FIX: message triggers were never called — add the missing handler
-        @client.event
-        async def on_message(m):
-            await cog._on_message_event(m)
-
         @client.event
         async def on_reaction_add(reaction, user):
             await cog._on_reaction(reaction, user)
@@ -55,22 +43,6 @@ class TriggersCog:
         @client.event
         async def on_member_remove(member):
             await cog._on_member(member, "leave")
-
-    async def _on_message_event(self, message):  # BUG-1 FIX: was missing entirely
-        client = S.CLIENT
-        if client is None: return
-        if getattr(message.author, "id", None) == getattr(getattr(client, "user", None), "id", None): return
-        content = (message.content or "").lower()
-        for t in S._triggers.get("message", []):
-            try:
-                if t.get("contains", "").lower() in content:
-                    S._trigger_fired_counts[t["name"]] = (
-                        S._trigger_fired_counts.get(t["name"], 0) + 1)
-                    reply = t.get("reply", "")
-                    if reply:
-                        try: await message.channel.send(reply)
-                        except Exception: pass
-            except Exception: pass
 
     async def _on_reaction(self, reaction, user):
         client = S.CLIENT

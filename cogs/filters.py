@@ -1,12 +1,4 @@
 # cogs/filters.py | anti-spam, anti-dupe, anti-link/invite/attachment/nsfw, ping protection, scam filter
-#
-# FIXES:
-#  [BUG-1] Anti-link whitelist logic was doubly-nested and internally contradictory:
-#          the outer condition could be True while the inner `if wl and all(...)` would
-#          immediately `pass` — effectively a no-op that masked the real intent.
-#          Simplified to a single, correct conditional:
-#            block if no whitelist, OR if any URL is not covered by the whitelist.
-
 import re
 import time
 import modifyself_shim as discord
@@ -20,7 +12,8 @@ SCAM_RE   = re.compile(r"(free\s*nitro|steamcommunity\.(com|ru)|gift\s*claim|fre
 
 async def _filters_pre_hook(client, message):
     f = S.filters
-    if not message.guild or message.author.id == client.user.id:
+    # BUG FIX: message.guild is never set in modifyself; use guild_id instead
+    if not getattr(message, 'guild_id', None) or int(message.author.id) == int(client.user.id):
         return
     content = message.content or ""
 
@@ -60,14 +53,14 @@ async def _filters_pre_hook(client, message):
     # link / invite
     if f["invite"]["enabled"] and INVITE_RE.search(content):
         return await _act(message, "invite link")
-
-    # BUG-1 FIX: simplified whitelist check
     if f["link"]["enabled"] and URL_RE.search(content):
         urls = URL_RE.findall(content)
         wl = f["link"]["whitelist"]
-        # Block if whitelist is empty, or if any URL isn't covered by the whitelist
-        if not wl or not all(any(w in u for w in wl) for u in urls):
-            return await _act(message, "link")
+        if not all(any(w in u for w in wl) for u in urls) or not wl:
+            if wl and all(any(w in u for w in wl) for u in urls):
+                pass
+            else:
+                return await _act(message, "link")
 
     # attachment
     if f["attachment"]["enabled"] and (message.attachments or []):

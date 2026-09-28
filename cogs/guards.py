@@ -62,10 +62,11 @@ class GuardsCog:
             await message.channel.send(S.ui_info("usage: whitelist add/remove/list/clear"))
 
     async def _serverblacklist(self, message, args):
-        if not message.guild:
+        gid = str(getattr(message, "guild_id", None) or "")
+        if not gid:
             return await message.channel.send(S.ui_err("server only"), delete_after=5)
         sub = args[1].lower() if len(args) > 1 else ""
-        gid = str(message.guild.id)
+        # gid already set above
         if sub == "add" and len(args) >= 3:
             S._cmd_blacklist_server.setdefault(gid, set()).add(args[2])
             await message.channel.send(S.ui_ok(f"blocked `{args[2]}`"))
@@ -74,7 +75,7 @@ class GuardsCog:
             await message.channel.send(S.ui_ok("removed"))
         elif sub == "list":
             rows = [f"  {S.GREY}•{S.RESET} {c}" for c in S._cmd_blacklist_server.get(gid, set())]
-            await message.channel.send(S._paginate("server blacklist", message.guild.name, rows)
+            await message.channel.send(S._paginate("server blacklist", f"server {gid}", rows)
                                         if rows else S.ui_info("empty"))
         elif sub == "clear":
             S._cmd_blacklist_server.pop(gid, None)

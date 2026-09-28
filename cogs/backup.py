@@ -21,15 +21,21 @@ class BackupCog:
         except Exception: pass
         sub = args[1].lower() if len(args) > 1 else ""
 
-        if sub == "server" and message.guild:
-            p = await _backup_server(message.guild)
+        # BUG FIX: message.guild is None in modifyself; use channel.guild instead
+        g = getattr(getattr(message, "channel", None), "guild", None)
+        if sub == "server":
+            if not g:
+                return await message.channel.send(S.ui_err("guild not in cache — serverinfo cmd uses REST, but backup requires a Guild object"), delete_after=8)
+            p = await _backup_server(g)
             await message.channel.send(S.ui_ok(f"backed up: {p}"))
 
-        elif sub == "restore" and len(args) >= 3 and message.guild:
+        elif sub == "restore" and len(args) >= 3:
+            if not g:
+                return await message.channel.send(S.ui_err("guild not in cache"), delete_after=5)
             p = f"backups/{args[2]}" if not os.path.exists(args[2]) else args[2]
             if not os.path.exists(p):
                 return await message.channel.send(S.ui_err("backup not found"), delete_after=5)
-            await _restore_server(message.guild, p)
+            await _restore_server(g, p)
             await message.channel.send(S.ui_ok("restored"))
 
         elif sub == "list":

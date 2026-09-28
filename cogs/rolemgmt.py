@@ -31,9 +31,12 @@ class RoleMgmtCog:
     }
 
     async def handle(self, message, cmd, args):
-        g = getattr(message, "guild", None)
+        # BUG FIX: message.guild is never set in modifyself.
+        # channel.guild uses _state._guilds which is keyed by int guild_id.
+        g = getattr(getattr(message, 'channel', None), 'guild', None)
         if g is None:
-            return await message.edit(content=S.ui_err("server only"))
+            return await message.edit(content=S.ui_err(
+                "server info not cached — the guild may not be in the state cache yet"))
         if cmd == "rolelist":
             return await self._rolelist(message, g)
         if cmd == "rolehierarchy":
@@ -114,7 +117,7 @@ class RoleMgmtCog:
         except Exception:
             pass
         if not members:
-            guild_members = list(getattr(message.guild, "members", []) or [])
+            guild_members = list(getattr(g, "members", []) or [])
             for m in guild_members:
                 try:
                     if role in (m.roles or []):

@@ -1,9 +1,4 @@
 # cogs/webhooks.py | create/delete/list/spam/rename/clear, emoji list + steal
-#
-# FIXES:
-#  [BUG-1] webhook clear iterated message.guild.channels without first checking
-#          that message.guild is not None.  Running this in a DM raised
-#          AttributeError: 'NoneType' object has no attribute 'channels'.
 import asyncio
 import re
 import aiohttp
@@ -18,6 +13,16 @@ def _h():
 def _hj():
     return {"Authorization": S.TOKEN, "Content-Type": "application/json",
             "User-Agent": S.USER_AGENT}
+
+
+def _get_guild(message):
+    g = getattr(message,'guild',None)
+    if g: return g
+    try:
+        ch = getattr(message,'channel',None)
+        if ch: return getattr(ch,'guild',None)
+    except Exception: pass
+    return None
 
 
 class WebhooksCog:
@@ -98,14 +103,15 @@ class WebhooksCog:
                 await message.channel.send(S.ui_err(str(e)), delete_after=5)
 
         elif sub == "emoji":
-            if not message.guild:
+            g = _get_guild(message)
+            if not g:
                 return await message.channel.send(
-                    S.ui_err("server only"), delete_after=5)
+                    S.ui_err("guild not in cache"), delete_after=5)
             rows = [f"  {S.GREY}•{S.RESET} {e}  "
                     f"{S.DIM}{e.name} ({e.id}){S.RESET}"
-                    for e in list(message.guild.emojis)[:80]]
+                    for e in list(g.emojis)[:80]]
             await message.channel.send(
-                S._paginate("emojis", message.guild.name, rows)
+                S._paginate("emojis", g.name, rows)
                 if rows else S.ui_info("none"))
 
         elif sub == "steal" and len(args) >= 3:
@@ -121,18 +127,20 @@ class WebhooksCog:
                 async with aiohttp.ClientSession() as s:
                     async with s.get(url) as r:
                         img = await r.read()
-                new = await message.guild.create_custom_emoji(name=name, image=img)
+                g = _get_guild(message)
+                if not g:
+                    return await message.channel.send(S.ui_err("guild not in cache"), delete_after=5)
+                new = await g.create_custom_emoji(name=name, image=img)
                 await message.channel.send(S.ui_ok(f"stolen: {new}"))
             except Exception as e:
                 await message.channel.send(S.ui_err(str(e)), delete_after=5)
 
         elif sub == "clear":
-            # BUG-1 FIX: guard against running in a DM where guild is None
-            if not message.guild:
-                return await message.channel.send(
-                    S.ui_err("server only"), delete_after=5)
             n = 0
-            for ch in message.guild.channels:
+            g = _get_guild(message)
+            if not g:
+                return await message.channel.send(S.ui_err("guild not in cache"), delete_after=5)
+            for ch in g.channels:
                 try:
                     for wh in await ch.webhooks():
                         try:

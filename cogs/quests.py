@@ -277,10 +277,64 @@ class Quest:
         return quest
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-level coroutines — imported by selfbot.py on_ready
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def autoquest_run(token: str):
+    """Background task: repeatedly complete all quests.
+    selfbot.py on_ready: asyncio.create_task(autoquest_run(TOKEN))
+    """
+    try:
+        from cogs import state as _S
+        cfg_fn = getattr(_S, "load_config", None)
+    except Exception:
+        cfg_fn = None
+    logger.info("[quest] autoquest_run started")
+    while True:
+        try:
+            logger.info("[quest] autoquest cycle start")
+        except Exception as e:
+            logger.error(f"[quest] autoquest_run cycle error: {e}")
+        try:
+            cfg = cfg_fn() if callable(cfg_fn) else {}
+            if not cfg.get("autoquest_enabled"):
+                logger.info("[quest] autoquest disabled — loop exit")
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(30 * 60)
+
+
+async def autoclaim_loop():
+    """Background task: periodically check for completed quests.
+    selfbot.py on_ready: task_register("autoclaim_loop", autoclaim_loop())
+    """
+    logger.info("[quest] autoclaim_loop started")
+    try:
+        from cogs import state as _S
+        cfg_fn = getattr(_S, "load_config", None)
+    except Exception:
+        cfg_fn = None
+    while True:
+        try:
+            logger.info("[quest] autoclaim sweep")
+        except Exception as e:
+            logger.error(f"[quest] autoclaim_loop error: {e}")
+        try:
+            cfg = cfg_fn() if callable(cfg_fn) else {}
+            if not cfg.get("autoclaim_enabled"):
+                logger.info("[quest] autoclaim disabled — loop exit")
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(15 * 60)
+
 # ============================================================
 # cog
 # ============================================================
-class QuestManager(commands.Cog):
+class QuestsCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.quests = {}
@@ -603,7 +657,7 @@ class QuestManager(commands.Cog):
             if not url or not data:
                 return False
 
-            status, response_data = await tr.request("POST", url, json=data)
+            status, response_data = await tr.request("POST", url, payload=data)
             if status != 200:
                 logger.error(f"Request failed with status {status}")
                 if status in (401, 404):

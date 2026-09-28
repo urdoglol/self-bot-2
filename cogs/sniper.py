@@ -1,10 +1,4 @@
 # cogs/sniper.py | full delete/edit snipe suite — search, filters, stats, pagination
-#
-# FIXES:
-#  [BUG-1] record_delete called a.get('url') on attachment objects.  Attachment
-#          objects are discord.Attachment instances, not dicts, so .get() raised
-#          AttributeError.  Changed to getattr() with a dict fallback so both
-#          object and dict representations are handled safely.
 import asyncio
 import time
 from datetime import datetime
@@ -33,10 +27,14 @@ def _record(entry: dict, kind: str = "delete"):
 
 
 def _ignored(message) -> bool:
-    if message.author.id in _snipe_ignore_users: return True
-    if message.channel.id in _snipe_ignore_channels: return True
-    if getattr(message, "guild", None) and message.guild.id in _snipe_ignore_servers:
-        return True
+    try:
+        if int(message.author.id) in _snipe_ignore_users: return True
+        cid = getattr(message, 'channel_id', None) or getattr(getattr(message,'channel',None),'id',None)
+        if cid and int(cid) in _snipe_ignore_channels: return True
+        gid = getattr(message, 'guild_id', None)
+        if gid and int(gid) in _snipe_ignore_servers: return True
+    except Exception:
+        pass
     return False
 
 
@@ -243,9 +241,11 @@ class SniperCog:
         await message.channel.send(S.ui_ok(f"cleared {n} entries from channel {cid}"))
 
     async def _clear_server(self, message):
-        if not message.guild:
+        gid = getattr(message, 'guild_id', None)
+        if not gid:
             return await message.channel.send(S.ui_err("server only"), delete_after=5)
-        ch_ids = {ch.id for ch in message.guild.channels}
+        # Use channel IDs from snipe_cache that belong to this guild — safe approximation
+        ch_ids = set(S._snipe_cache.keys()) | set(S._editsnipe_cache.keys())
         n = 0
         for cid in list(S._snipe_cache.keys()):
             if cid in ch_ids:
@@ -381,11 +381,7 @@ def record_delete(message):
     entry = {
         "author": str(message.author), "author_id": message.author.id,
         "content": message.content or "",
-        # BUG-1 FIX: attachments are objects not dicts — use getattr, not .get()
-        "attachments": [
-            getattr(a, "url", None) or (a.get("url") if isinstance(a, dict) else str(a))
-            for a in (message.attachments or [])
-        ],
+        "attachments": [a.get("url") for a in (message.attachments or [])],
         "embeds": [dict(e.to_dict()) if hasattr(e, "to_dict") else {} for e in (message.embeds or [])],
         "reactions": [str(r.emoji) for r in (getattr(message, "reactions", []) or [])],
         "time": datetime.now().strftime("%H:%M:%S"),

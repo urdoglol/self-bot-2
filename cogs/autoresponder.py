@@ -21,13 +21,13 @@ def _scope_match(rule, message):
     sc = rule.get("scope", {})
     if not sc:
         return True
-    if sc.get("users") and message.author.id not in sc["users"]:
+    if sc.get("users") and int(message.author.id) not in sc["users"]:
         return False
-    if sc.get("channels") and message.channel.id not in sc["channels"]:
+    if sc.get("channels") and int(message.channel_id) not in sc["channels"]:
         return False
     if sc.get("servers"):
-        gid = getattr(getattr(message, "guild", None), "id", None)
-        if gid not in sc["servers"]:
+        gid = getattr(message, "guild_id", None)
+        if not gid or int(gid) not in sc["servers"]:
             return False
     if sc.get("time_range"):
         lo, hi = sc["time_range"]

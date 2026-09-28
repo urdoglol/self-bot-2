@@ -72,10 +72,11 @@ class NicknameCog:
                 f"autonick: auto={n['auto']} pattern={n['pattern']} interval={n['interval']}s"))
 
         elif cmd == "nickset":
-            if not message.guild or len(args) < 3:
+            g = getattr(getattr(message,'channel',None),'guild',None)
+            if not g or len(args) < 3:
                 return await message.edit(content=S.ui_err("usage: nickset <uid> <nick>"))
             try:
-                m = message.guild.get_member(int(args[1]))
+                m = g.get_member(int(args[1]))
                 await m.edit(nick=" ".join(args[2:]))
                 await message.edit(content=S.ui_ok("set"))
             except Exception as e:

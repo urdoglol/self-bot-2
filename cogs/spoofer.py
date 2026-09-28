@@ -1,12 +1,4 @@
 # cogs/spoofer.py | platform pool spoofing — rotate / random / sticky + watchdog
-#
-# FIXES:
-#  [BUG-1] _start_watchdog() called asyncio.get_event_loop() which is deprecated
-#          in Python 3.10+ and raises RuntimeError in 3.12+ when no event loop
-#          is running (e.g. when SpooferCog is instantiated before the bot's loop
-#          starts).  Changed to asyncio.get_running_loop() which raises RuntimeError
-#          if there is no *running* loop — letting the caller's try/except in
-#          __init__ handle the case cleanly without a deprecation warning.
 import asyncio
 import importlib
 import inspect
@@ -419,13 +411,7 @@ class SpooferCog:
     def _start_watchdog(self):
         if self._watchdog_task and not self._watchdog_task.done():
             return
-        # BUG-1 FIX: get_event_loop() is deprecated in 3.10+ and raises in 3.12+
-        # when called outside a running loop.  get_running_loop() raises RuntimeError
-        # cleanly, which the try/except in __init__ already catches.
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return  # no event loop running yet; register() will call this again
+        loop = asyncio.get_event_loop()
         self._watchdog_task = loop.create_task(self._watchdog())
 
     async def _watchdog(self):

@@ -211,7 +211,7 @@ def _perm_check(cmd, message) -> bool:
     if str(channel_id) in _cmd_blacklist_channel:
         if cmd in _cmd_blacklist_channel[str(channel_id)]: return False
     if cmd in _role_restrict:
-        if not message.guild or not hasattr(message.author, 'roles'): return False
+        if not getattr(message, 'guild_id', None) or not hasattr(message.author, 'roles'): return False
         have = {int(r.id) for r in message.author.roles}   # normalise role IDs too
         if not (have & _role_restrict[cmd]): return False
     if cmd in _perm_block: return False

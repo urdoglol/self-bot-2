@@ -239,9 +239,9 @@ class AfkCog:
                 await message.edit(content=S.ui_info("usage: afkcustom set/remove"))
 
         elif cmd == "afkserver":
-            if not message.guild:
+            gid = str(getattr(message, "guild_id", None) or "")
+            if not gid:
                 return await message.edit(content=S.ui_err("server only"))
-            gid = str(message.guild.id)
             if len(args) < 2:
                 return await message.edit(content=S.ui_err(
                     f"usage: afkserver set <text> | afkserver clear"))

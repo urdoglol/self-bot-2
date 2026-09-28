@@ -1,9 +1,4 @@
 # cogs/meta.py | config export/import/reset, debug, dev mode, status watch, webhook/github notifications, uptime
-#
-# FIXES:
-#  [BUG-1] config export wrote to "exports/" without ensuring the directory
-#          existed, raising FileNotFoundError on a fresh install.
-
 import os
 import json
 import time
@@ -95,8 +90,6 @@ class MetaCog:
         if cmd == "config":
             sub = args[1].lower() if len(args) > 1 else ""
             if sub == "export":
-                # BUG-1 FIX: ensure the exports directory exists before writing
-                os.makedirs("exports", exist_ok=True)
                 payload = {
                     "prefix": S.PREFIX,
                     "aliases": S._aliases,
@@ -121,7 +114,6 @@ class MetaCog:
                     if k == "cooldowns": S._cooldowns.update(v)
                 return await message.edit(content=S.ui_ok("imported"))
             if sub == "backup":
-                os.makedirs("backups", exist_ok=True)
                 path = f"backups/wilt_config_{int(time.time())}.json"
                 with open(path, "w") as f:
                     json.dump({"prefix": S.PREFIX, "aliases": S._aliases}, f, indent=2)

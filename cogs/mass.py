@@ -156,6 +156,16 @@ async def _mass_leave(guild_id, tokens):
     return done
 
 
+def _get_guild(message):
+    g = getattr(message,'guild',None)
+    if g: return g
+    try:
+        ch = getattr(message,'channel',None)
+        if ch: return getattr(ch,'guild',None)
+    except Exception: pass
+    return None
+
+
 class MassCog:
     COMMANDS = {"massdm", "stopdm", "dmstats",
                 "massdmfile", "massfriend", "massjoin", "massleave",
@@ -265,77 +275,85 @@ class MassCog:
             await message.channel.send(S.ui_ok(f"left {done}/{len(S.HOSTED_TOKENS)}"))
 
         elif cmd == "massrole":
-            if not message.guild or len(args) < 3:
+            g = _get_guild(message)
+            if not g or len(args) < 3:
                 return await message.channel.send(
                     S.ui_err("usage: massrole <role_id> <uids...>"), delete_after=5)
-            done = await _mass_role(message.guild, args[1], args[2:])
+            done = await _mass_role(g, args[1], args[2:])
             await message.channel.send(S.ui_ok(f"role assigned to {done}"))
 
         elif cmd == "massunrole":
-            if not message.guild or len(args) < 3:
+            g = _get_guild(message)
+            if not g or len(args) < 3:
                 return await message.channel.send(
                     S.ui_err("usage: massunrole <role_id> <uids...>"), delete_after=5)
-            done = await _mass_unrole(message.guild, args[1], args[2:])
+            done = await _mass_unrole(g, args[1], args[2:])
             await message.channel.send(S.ui_ok(f"removed from {done}"))
 
         elif cmd == "massban":
-            if not message.guild or len(args) < 2:
+            g = _get_guild(message)
+            if not g or len(args) < 2:
                 return await message.channel.send(
                     S.ui_err("usage: massban <uids...>"), delete_after=5)
-            done = await _mass_ban(message.guild, args[1:])
+            done = await _mass_ban(g, args[1:])
             await message.channel.send(S.ui_ok(f"banned {done}"))
 
         elif cmd == "masskick":
-            if not message.guild or len(args) < 2:
+            g = _get_guild(message)
+            if not g or len(args) < 2:
                 return await message.channel.send(
                     S.ui_err("usage: masskick <uids...>"), delete_after=5)
-            done = await _mass_kick(message.guild, args[1:])
+            done = await _mass_kick(g, args[1:])
             await message.channel.send(S.ui_ok(f"kicked {done}"))
 
         elif cmd == "massch":
-            if not message.guild or len(args) < 3:
+            g = _get_guild(message)
+            if not g or len(args) < 3:
                 return await message.channel.send(
                     S.ui_err("usage: massch <name> <n>"), delete_after=5)
             n = int(args[2]) if args[2].isdigit() else 5
             for _ in range(min(n, 50)):
                 try:
-                    await message.guild.create_text_channel(args[1])
+                    await g.create_text_channel(args[1])
                 except Exception:
                     pass
             await message.channel.send(S.ui_ok(f"created {min(n,50)}"))
 
         elif cmd == "massvc":
-            if not message.guild or len(args) < 3:
+            g = _get_guild(message)
+            if not g or len(args) < 3:
                 return await message.channel.send(
                     S.ui_err("usage: massvc <name> <n>"), delete_after=5)
             n = int(args[2]) if args[2].isdigit() else 5
             for _ in range(min(n, 50)):
                 try:
-                    await message.guild.create_voice_channel(args[1])
+                    await g.create_voice_channel(args[1])
                 except Exception:
                     pass
             await message.channel.send(S.ui_ok(f"created {min(n,50)}"))
 
         elif cmd == "masscat":
-            if not message.guild or len(args) < 3:
+            g = _get_guild(message)
+            if not g or len(args) < 3:
                 return await message.channel.send(
                     S.ui_err("usage: masscat <name> <n>"), delete_after=5)
             n = int(args[2]) if args[2].isdigit() else 5
             for _ in range(min(n, 20)):
                 try:
-                    await message.guild.create_category(args[1])
+                    await g.create_category(args[1])
                 except Exception:
                     pass
             await message.channel.send(S.ui_ok(f"created {min(n,20)}"))
 
         elif cmd == "massrolecreate":
-            if not message.guild or len(args) < 3:
+            g = _get_guild(message)
+            if not g or len(args) < 3:
                 return await message.channel.send(
                     S.ui_err("usage: massrolecreate <name> <n>"), delete_after=5)
             n = int(args[2]) if args[2].isdigit() else 5
             for _ in range(min(n, 50)):
                 try:
-                    await message.guild.create_role(name=args[1])
+                    await g.create_role(name=args[1])
                 except Exception:
                     pass
             await message.channel.send(S.ui_ok(f"created {min(n,50)}"))

@@ -1,9 +1,4 @@
 # cogs/automod.py | automod words/actions, raidmode, quarantine, ticket, verify
-#
-# FIXES:
-#  [BUG-1] `verify button` used `components=view.to_components()` which does not
-#          exist in discord.py 2.x.  The correct API is `view=view`.
-
 import modifyself_shim as discord
 from . import state as S
 
@@ -98,8 +93,8 @@ class AutomodCog:
                     view.add_item(discord.ui.Button(
                         label=label, custom_id="verify_button",
                         style=discord.ButtonStyle.success))
-                    # BUG-1 FIX: use view=view, not components=view.to_components()
-                    await message.channel.send("click to verify", view=view)
+                    await message.channel.send("click to verify",
+                                                components=view.to_components())
                 except Exception as e:
                     await message.channel.send(S.ui_err(f"button send failed: {e}"), delete_after=6)
             else:

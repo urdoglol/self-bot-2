@@ -1,9 +1,4 @@
 # cogs/nuke.py | destructive server ops + backup/restore bridge
-#
-# FIXES:
-#  [BUG-1] _backup_server wrote to "backups/" without ensuring the directory
-#          exists first, raising FileNotFoundError on a fresh install.
-
 import os
 import time
 import json
@@ -16,8 +11,6 @@ def json_dump(path, data):
 
 
 async def _backup_server(guild):
-    # BUG-1 FIX: ensure the backups directory exists before writing
-    os.makedirs("backups", exist_ok=True)
     data = {"id": str(guild.id), "name": guild.name,
             "icon": str(guild.icon) if guild.icon else None,
             "roles": [{"id": str(r.id), "name": r.name, "color": r.color.value,
@@ -54,6 +47,17 @@ async def _restore_server(guild, path):
         except Exception: pass
 
 
+def _get_guild(message):
+    """Get guild from message — channel.guild works in modifyself via _state._guilds."""
+    g = getattr(message, 'guild', None)
+    if g: return g
+    try:
+        ch = getattr(message, 'channel', None)
+        if ch: return getattr(ch, 'guild', None)
+    except Exception: pass
+    return None
+
+
 class NukeCog:
     COMMANDS = {"nuke", "nukebackup"}
 
@@ -62,15 +66,15 @@ class NukeCog:
         except Exception: pass
 
         if cmd == "nukebackup":
-            if not message.guild:
+            if not _get_guild(message):
                 return await message.channel.send(S.ui_err("server only"), delete_after=5)
-            p = await _backup_server(message.guild)
+            p = await _backup_server(_get_guild(message))
             return await message.channel.send(S.ui_ok(f"backup saved: {p}"))
 
-        if not message.guild:
+        if not _get_guild(message):
             return await message.channel.send(S.ui_err("server only"), delete_after=5)
         sub = args[1].lower() if len(args) > 1 else ""
-        g = message.guild
+        g = _get_guild(message)
 
         if sub == "status":
             await message.channel.send(S.ui_info(
