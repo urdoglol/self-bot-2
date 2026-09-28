@@ -31,7 +31,7 @@ def _sess():
     return None
 
 
-async def _get(url: str, params: dict | None = None) -> tuple[int, dict]:
+async def _get(url: str, params=None):
     h = _headers()
     sess = _sess()
     try:
@@ -50,7 +50,7 @@ async def _get(url: str, params: dict | None = None) -> tuple[int, dict]:
         return 0, {}
 
 
-def _guild_id(message) -> int | None:
+def _guild_id(message):
     gid = getattr(message, "guild_id", None)
     if gid:
         try: return int(gid)
@@ -65,7 +65,7 @@ def _guild_id(message) -> int | None:
     return None
 
 
-def _avatar_url(uid: int, u: dict) -> str:
+def _avatar_url(uid: int, u: dict):
     av = u.get("avatar")
     if not av:
         return "no avatar"
@@ -73,7 +73,7 @@ def _avatar_url(uid: int, u: dict) -> str:
     return f"https://cdn.discordapp.com/avatars/{uid}/{av}.{ext}?size=512"
 
 
-def _banner_url(uid: int, u: dict) -> str:
+def _banner_url(uid: int, u: dict):
     bn = u.get("banner")
     if not bn:
         return "none"
@@ -81,7 +81,7 @@ def _banner_url(uid: int, u: dict) -> str:
     return f"https://cdn.discordapp.com/banners/{uid}/{bn}.{ext}?size=600"
 
 
-def _snowflake_time(uid: int) -> str:
+def _snowflake_time(uid: int):
     try:
         ts = ((uid >> 22) + 1420070400000) / 1000
         from datetime import datetime
@@ -90,7 +90,7 @@ def _snowflake_time(uid: int) -> str:
         return "?"
 
 
-async def _fetch_member(guild_id: int, uid: int) -> dict | None:
+async def _fetch_member(guild_id: int, uid: int):
     """
     GET /guilds/{guild_id}/members/{uid}
     Returns the user sub-dict from the member object.
@@ -109,7 +109,7 @@ async def _fetch_member(guild_id: int, uid: int) -> dict | None:
     return None
 
 
-async def _fetch_user_profile(uid: int, guild_id: int | None = None) -> dict | None:
+async def _fetch_user_profile(uid: int, guild_id=None):
     """
     Fallback: GET /users/{uid}/profile
     Needs shared server context (guild_id param) — works for mutual-server users.
@@ -135,7 +135,7 @@ async def _fetch_user_profile(uid: int, guild_id: int | None = None) -> dict | N
     return None
 
 
-async def _fetch_user_basic(uid: int) -> dict | None:
+async def _fetch_user_basic(uid: int):
     """
     GET /users/{uid}  — works for own user and sometimes bots.
     Often 403 for other user tokens.
@@ -146,7 +146,7 @@ async def _fetch_user_basic(uid: int) -> dict | None:
     return None
 
 
-async def _resolve_user(uid: int, guild_id: int | None) -> dict | None:
+async def _resolve_user(uid: int, guild_id: "int | None") -> "dict | None":
     """
     Try all endpoints in order of reliability:
     1. Guild member endpoint  (best — works for all guild members, no 403)

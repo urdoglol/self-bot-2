@@ -55,26 +55,26 @@ async def _rest(method: str, url: str, **kwargs):
         return 0, {}
 
 
-async def _fetch_guild(guild_id: int) -> dict:
+async def _fetch_guild(guild_id: int):
     """Fetch full guild data from REST API."""
     _, d = await _rest("GET",
         f"https://discord.com/api/v9/guilds/{guild_id}?with_counts=true")
     return d or {}
 
 
-async def _fetch_guild_channels(guild_id: int) -> list:
+async def _fetch_guild_channels(guild_id: int):
     _, d = await _rest("GET",
         f"https://discord.com/api/v9/guilds/{guild_id}/channels")
     return d if isinstance(d, list) else []
 
 
-async def _fetch_guild_roles(guild_id: int) -> list:
+async def _fetch_guild_roles(guild_id: int):
     _, d = await _rest("GET",
         f"https://discord.com/api/v9/guilds/{guild_id}/roles")
     return d if isinstance(d, list) else []
 
 
-def _get_guild_id(message) -> int | None:
+def _get_guild_id(message):
     """
     Extract the guild_id from the message as a plain int.
     modifyself sets message.guild_id = int(...) directly.
@@ -148,7 +148,7 @@ def _get_guild_obj(message):
     return None
 
 
-def _snowflake_time(snowflake_id: int) -> str:
+def _snowflake_time(snowflake_id: int):
     """Convert a Discord snowflake to a human-readable date."""
     try:
         ts = ((snowflake_id >> 22) + 1420070400000) / 1000

@@ -76,7 +76,7 @@ def _parse_user_id(token: str):
 
 
 def _parse_user_and_emoji(args: list, start: int = 1,
-                           raw_content: str = "") -> tuple:
+                           raw_content: str = ""):
     """
     Parse (user_id_or_None, emoji_str_or_None) from args[start:].
 
@@ -85,7 +85,7 @@ def _parse_user_and_emoji(args: list, start: int = 1,
     Otherwise parse the emoji starting at args[start] with no user.
 
     Returns:
-        (uid: int | None, emoji: str | None)
+        (uid: "int | None", emoji: "str | None")
     """
     if len(args) <= start:
         return None, None
@@ -120,7 +120,7 @@ def _sync(**kw):
             pass
 
 
-def _emoji_to_str(emoji) -> str:
+def _emoji_to_str(emoji):
     if isinstance(emoji, str):
         return emoji
     name     = getattr(emoji, "name",     None)
@@ -131,7 +131,7 @@ def _emoji_to_str(emoji) -> str:
     return str(name or emoji)
 
 
-def _emoji_url_part(emoji_str: str) -> str:
+def _emoji_url_part(emoji_str: str):
     """
     Encode emoji for Discord's PUT reaction URL.
     Custom <a:name:id> / <:name:id>  →  name%3Aid  (no angle brackets)
@@ -144,7 +144,7 @@ def _emoji_url_part(emoji_str: str) -> str:
 
 
 def _parse_emoji_arg(args: list, start: int = 1,
-                     raw_content: str = "") -> str:
+                     raw_content: str = ""):
     """
     Extract the first emoji from args[start:], using raw_content for split
     tokens (e.g. <:name:id> split into ["<:name", "id>"] by the parser).
@@ -179,7 +179,7 @@ def _parse_emoji_arg(args: list, start: int = 1,
     return joined.split()[0] if joined.split() else joined
 
 
-def _resolve_emoji(client, raw: str) -> str:
+def _resolve_emoji(client, raw: str):
     """Resolve :shortcode: / bare name → <:name:id> by searching joined guilds."""
     if _RE_CUSTOM.match(raw.strip()):
         return raw
@@ -196,7 +196,7 @@ def _resolve_emoji(client, raw: str) -> str:
 # REST reaction
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _react_once(session, channel_id, message_id, emoji) -> tuple:
+async def _react_once(session, channel_id, message_id, emoji):
     emoji_enc = _emoji_url_part(_emoji_to_str(emoji))
     url = (f"https://discord.com/api/v9/channels/{channel_id}"
            f"/messages/{message_id}/reactions/{emoji_enc}/@me")
@@ -221,7 +221,7 @@ async def _react_once(session, channel_id, message_id, emoji) -> tuple:
         return -1, None
 
 
-async def _react(channel_id, message_id, emoji, session=None) -> int:
+async def _react(channel_id, message_id, emoji, session=None):
     own = session is None
     if own:
         session = aiohttp.ClientSession()
@@ -457,13 +457,13 @@ class AutoCog:
         main = sys.modules.get("__main__")
         return getattr(main, "client", None) if main else None
 
-    def _resolve(self, raw: str) -> str:
+    def _resolve(self, raw: str):
         if _RE_CUSTOM.match(raw.strip()):
             return raw
         client = self._client()
         return _resolve_emoji(client, raw) if client else raw
 
-    def _ulabel(self, uid: int) -> str:
+    def _ulabel(self, uid: int):
         return f"<@{uid}> ({uid})"
 
     # ── dispatch ──────────────────────────────────────────────────────────────
