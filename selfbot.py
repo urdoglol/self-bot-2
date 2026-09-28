@@ -159,7 +159,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-VERSION = "2.6.1"
+VERSION = "2.7.0"
 OWNER_ID = 1551632054574121051
 LOG_FILE = "message_log.txt"
 
@@ -598,6 +598,7 @@ HELP_DATA = {
         ("rpc <slot> clear","wipe that slot"),
         ("rpc status","show all 6 slots"),
         ("rpc clearall","wipe every slot"),
+        ("rpc reload","re-import rpc.py mid-session — no restart needed"),
         ("rpc1 <field> <value>","slot 1 shorthand"),
         ("rpc2 <field> <value>","slot 2 shorthand"),
         ("rpc3 <field> <value>","slot 3 shorthand"),
@@ -840,18 +841,35 @@ HELP_DATA = {
         ("note <user_id> <text>","set note on user"),("autoaddback on/off","auto-accept friend requests"),
     ],
     "auto": [
-        ("giveaway on/off","auto-enter giveaways"),("nitrosniper on/off","auto-redeem nitro gift codes"),
-        ("autoreact <emoji>","auto-react to your own messages"),
-        ("autoreactstop","stop auto-react"),
-        ("superreact <emoji>","continuous react to your own messages"),
-        ("superreactstop","stop superreact"),
-        ("multireact add <emoji>","add emoji to multi-react pool"),
-        ("multireact remove <emoji>","remove emoji from pool"),
-        ("multireact list","list pool"),("multireact on/off","toggle multi-react"),
+        ("giveaway on/off","auto-enter giveaways"),
+        ("nitrosniper on/off","auto-redeem nitro gift codes"),
+        ("autoreact <emoji>","react to ALL messages globally"),
+        ("autoreact <user> <emoji>","react to a specific user's messages — user = @mention or id"),
+        ("autoreact list","show global + every per-user autoreact target"),
+        ("autoreact off","disable global autoreact"),
+        ("autoreactstop","stop global autoreact"),
+        ("autoreactstop <user>","remove per-user autoreact target"),
+        ("autoreactstop all","stop global + every per-user target"),
+        ("superreact <emoji>","react to YOUR OWN messages"),
+        ("superreact <user> <emoji>","react to a specific user's messages"),
+        ("superreact list","show self + every per-user superreact target"),
+        ("superreact stop","disable own-message superreact"),
+        ("superreactstop","stop own-message superreact"),
+        ("superreactstop <user>","remove per-user superreact target"),
+        ("superreactstop all","stop own + every per-user target"),
+        ("multireact add <emoji>","add emoji to global pool"),
+        ("multireact add <user> <emoji>","add emoji to a specific user's pool"),
+        ("multireact remove <emoji>","remove from global pool"),
+        ("multireact remove <user> <emoji>","remove from user's pool"),
+        ("multireact on/off","toggle global multi-react"),
+        ("multireact on/off <user>","toggle multi-react for a specific user"),
+        ("multireact list","show global pool + every per-user pool"),
+        ("multireact clear","clear global pool"),
+        ("multireact clear <user>","clear a specific user's pool"),
         ("autoaddback on/off","auto-accept friend requests"),
         ("vsniper add <code> <gid>","add vanity url to watch list"),
         ("vsniper start/stop/list","vanity sniper control"),
-        ("reactdiag","show autoreact/superreact state"),
+        ("reactdiag","show all react targets — global + per-user"),
     ],
     "spoofer": [
         ("platform [name]","show pool or set a single sticky platform"),
@@ -1271,28 +1289,38 @@ async def clear_hypesquad():
         return False
 
 def _perm_check(cmd, message):
+    # Normalise IDs to plain int — modifyself Snowflake.__hash__ returns id>>22
+    # which differs from hash(int(id)), so membership tests silently missed.
+    try:
+        author_id  = int(message.author.id)
+        channel_id = int(getattr(message, "channel_id", None)
+                         or getattr(getattr(message, "channel", None), "id", 0))
+        guild_id   = int(getattr(getattr(message, "guild", None), "id", 0) or 0)
+    except Exception:
+        return False
+
     for hc in _hosted_clients:
         try:
-            if hc.user and hc.user.id == message.author.id:
+            if hc.user and int(hc.user.id) == author_id:
                 return True
         except Exception:
             pass
     if cmd in _cmd_disabled: return False
-    if message.author.id in _user_blacklist: return False
-    if _user_whitelist and message.author.id not in _user_whitelist: return False
-    if message.guild and str(message.guild.id) in _cmd_blacklist_server:
-        if cmd in _cmd_blacklist_server[str(message.guild.id)]: return False
-    if str(message.channel.id) in _cmd_blacklist_channel:
-        if cmd in _cmd_blacklist_channel[str(message.channel.id)]: return False
+    if author_id in _user_blacklist: return False
+    if _user_whitelist and author_id not in _user_whitelist: return False
+    if guild_id and str(guild_id) in _cmd_blacklist_server:
+        if cmd in _cmd_blacklist_server[str(guild_id)]: return False
+    if str(channel_id) in _cmd_blacklist_channel:
+        if cmd in _cmd_blacklist_channel[str(channel_id)]: return False
     if cmd in _role_restrict:
         if not message.guild or not hasattr(message.author, "roles"): return False
-        have = {r.id for r in message.author.roles}
+        have = {int(r.id) for r in message.author.roles}
         if not (have & _role_restrict[cmd]): return False
     if cmd in _perm_block: return False
-    if cmd in _perm_channel and message.channel.id != _perm_channel[cmd]: return False
-    if cmd in _perm_server and (message.guild is None or message.guild.id != _perm_server[cmd]): return False
+    if cmd in _perm_channel and channel_id != _perm_channel[cmd]: return False
+    if cmd in _perm_server and guild_id != _perm_server[cmd]: return False
     if cmd in _perm_allow and _perm_allow[cmd]:
-        return message.author.id in _perm_allow[cmd]
+        return author_id in _perm_allow[cmd]
     return True
 
 def db_stats_inc(cmd):
