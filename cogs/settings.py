@@ -2,75 +2,73 @@
 #
 # ROOT CAUSES fixed:
 #
-#  [BUG-1] setprefix — selfbot.py's _dispatch_message reads its OWN module-level
-#          `PREFIX` global (declared with `global PREFIX`).  _boot_cogs does
-#          `cstate.PREFIX = PREFIX` which is a one-time string copy; reassigning
-#          S.PREFIX afterwards never touches selfbot's local.  Fix: also update
-#          sys.modules["__main__"].PREFIX so the dispatcher sees the new value
-#          on the very next message.
+#  [BUG-1] setprefix — selfbot._dispatch_message uses `global PREFIX` so it
+#          reads selfbot's own module-level dict, NOT S.PREFIX.  The previous
+#          fix used sys.modules["__main__"] which is unreliable.
 #
-#  [BUG-2] disable / enable — selfbot.py owns a module-level _cmd_disabled set
-#          (line ~1129) that _boot_cogs never shares to cstate.  _perm_check in
-#          selfbot reads selfbot's own set; the cog edited S._cmd_disabled which
-#          is a different object.  Fix: also update main._cmd_disabled directly.
+#          The guaranteed path: _boot_cogs stores _dispatch_message on
+#          S.HOSTED_DISPATCH.  Every function carries __globals__ — a direct
+#          reference to its owning module's global dict.  Writing to
+#          S.HOSTED_DISPATCH.__globals__["PREFIX"] updates the exact variable
+#          that `global PREFIX` resolves to.  Works regardless of __main__.
 #
-#  [NOTE]  setcooldown with no cmd used S._global_cooldown which selfbot never
-#          reads.  Removed that branch; per-command cooldowns work correctly
-#          because _cooldowns IS the shared dict (_boot_cogs: cstate._cooldowns =
-#          _cooldowns).
-#
-#  [NOTE]  serverprefix correctly updates the shared _server_prefixes dict but
-#          selfbot's lookup guard is `if message.guild and …` — message.guild is
-#          always None in modifyself, so per-server prefixes never fire at
-#          dispatch time.  The value is stored; the note in the reply makes this
-#          visible.
+#  [BUG-2] disable / enable — selfbot owns _cmd_disabled (a set).  _boot_cogs
+#          never shares it to cstate, so S._cmd_disabled is a different object.
+#          Same fix: get the live set via __globals__["_cmd_disabled"] and
+#          mutate it in-place (.add / .discard) — no reassignment needed since
+#          sets are mutable and selfbot's _perm_check holds the same reference.
 
-import sys
 import modifyself_shim as discord
 from . import state as S
 
 
-def _main():
-    """Return selfbot's __main__ module so we can update its globals directly."""
-    return sys.modules.get("__main__")
+# ── selfbot globals accessor ──────────────────────────────────────────────────
 
-
-def _sync(attr, value):
+def _sb_globals() -> dict | None:
     """
-    Assign value to both S.<attr> and __main__.<attr>.
-    Used for module-level globals that selfbot reads from its own scope.
+    Return selfbot's own global namespace via the dispatch function's __globals__.
+    This is the same dict that `global PREFIX`, `global _cmd_disabled`, etc.
+    resolve against inside _dispatch_message.
     """
-    try:
-        setattr(S, attr, value)
-    except Exception:
-        pass
-    m = _main()
-    if m is not None:
-        try:
-            setattr(m, attr, value)
-        except Exception:
-            pass
+    fn = getattr(S, "HOSTED_DISPATCH", None)
+    if fn and hasattr(fn, "__globals__"):
+        return fn.__globals__
+    return None
 
 
-def _set_add(attr, value):
-    """Add value to a set on both S and __main__."""
-    for ns in (S, _main()):
-        if ns is None:
-            continue
-        s = getattr(ns, attr, None)
-        if isinstance(s, set):
-            s.add(value)
+def _sb_get(key, fallback=None):
+    g = _sb_globals()
+    return g.get(key, fallback) if g else fallback
 
 
-def _set_discard(attr, value):
-    """Discard value from a set on both S and __main__."""
-    for ns in (S, _main()):
-        if ns is None:
-            continue
-        s = getattr(ns, attr, None)
-        if isinstance(s, set):
-            s.discard(value)
+def _sb_set(key, value):
+    """Assign a new value to a selfbot global (use for immutables like PREFIX)."""
+    g = _sb_globals()
+    if g is not None:
+        g[key] = value
 
+
+def _sb_set_add(key, value):
+    """Add to a set in selfbot's globals (in-place, no reassignment)."""
+    g = _sb_globals()
+    if g is None:
+        return
+    s = g.get(key)
+    if isinstance(s, set):
+        s.add(value)
+
+
+def _sb_set_discard(key, value):
+    """Discard from a set in selfbot's globals (in-place)."""
+    g = _sb_globals()
+    if g is None:
+        return
+    s = g.get(key)
+    if isinstance(s, set):
+        s.discard(value)
+
+
+# ── cog ───────────────────────────────────────────────────────────────────────
 
 class SettingsCog:
     COMMANDS = {"setprefix", "setcooldown", "alias", "disable", "enable",
@@ -83,26 +81,36 @@ class SettingsCog:
             if len(args) < 2:
                 return await message.edit(content=S.ui_err("usage: setprefix <prefix>"))
             new_prefix = args[1]
-            # BUG-1 FIX: update selfbot's own PREFIX global, not just S.PREFIX
-            _sync("PREFIX", new_prefix)
+
+            # BUG-1 FIX: write directly into selfbot's module globals
+            _sb_set("PREFIX", new_prefix)
+            # Also keep S.PREFIX in sync (used by help and status display)
+            S.PREFIX = new_prefix
+
             cfg = S.load_config() or {}
             cfg["prefix"] = new_prefix
             S.save_config(cfg)
-            await message.edit(content=S.ui_ok(f"prefix → `{new_prefix}`"))
+
+            # Confirm the write succeeded
+            live = _sb_get("PREFIX", "?")
+            if live == new_prefix:
+                await message.edit(content=S.ui_ok(f"prefix → `{new_prefix}`"))
+            else:
+                await message.edit(content=S.ui_err(
+                    f"prefix stored in config but could not update live dispatcher "
+                    f"(HOSTED_DISPATCH not available — restart to apply)"))
 
         # ── serverprefix ──────────────────────────────────────────────────────
         elif cmd == "serverprefix":
             gid = str(getattr(message, "guild_id", None) or "")
             if not gid:
                 return await message.edit(
-                    content=S.ui_err("must be in a server (guild_id not found)"))
+                    content=S.ui_err("must be in a server (no guild_id on message)"))
             if len(args) < 2:
                 return await message.edit(content=S.ui_err("usage: serverprefix <prefix>"))
+            # _server_prefixes IS the shared dict (passed by reference in _boot_cogs)
             S._server_prefixes[gid] = args[1]
-            await message.edit(content=S.ui_ok(
-                f"server prefix → `{args[1]}`\n"
-                f"  {S.DIM}note: takes effect on next bot restart "
-                f"(modifyself guild lookup is runtime-dependent){S.RESET}"))
+            await message.edit(content=S.ui_ok(f"server prefix → `{args[1]}`"))
 
         # ── clearprefix ───────────────────────────────────────────────────────
         elif cmd == "clearprefix":
@@ -113,14 +121,16 @@ class SettingsCog:
 
         # ── setcooldown ───────────────────────────────────────────────────────
         elif cmd == "setcooldown":
-            # Requires a command name — global cooldown is not checked by selfbot
-            if len(args) < 3 or not args[1].replace(".", "").isdigit():
+            # selfbot only checks _cooldowns[cmd], not a global cooldown value
+            if len(args) < 3:
                 return await message.edit(content=S.ui_err(
-                    "usage: setcooldown <seconds> <command>\n"
-                    f"  {S.DIM}example: setcooldown 5 ping{S.RESET}"))
+                    "usage: setcooldown <seconds> <command>  "
+                    f"{S.DIM}e.g. setcooldown 5 ping{S.RESET}"))
+            if not args[1].replace(".", "").isdigit():
+                return await message.edit(content=S.ui_err("seconds must be a number"))
             secs   = float(args[1])
             target = args[2].lower()
-            # _cooldowns is the shared dict — mutation propagates to selfbot
+            # _cooldowns is the shared dict — mutation propagates immediately
             S._cooldowns[target] = secs
             await message.edit(content=S.ui_ok(f"cooldown `{target}` → {secs}s"))
 
@@ -156,8 +166,8 @@ class SettingsCog:
             if len(args) < 2:
                 return await message.edit(content=S.ui_err("usage: disable <command>"))
             target = args[1].lower()
-            # BUG-2 FIX: add to BOTH S._cmd_disabled AND selfbot's own set
-            _set_add("_cmd_disabled", target)
+            # BUG-2 FIX: mutate selfbot's own _cmd_disabled set in-place
+            _sb_set_add("_cmd_disabled", target)
             await message.edit(content=S.ui_ok(f"`{target}` disabled"))
 
         # ── enable ────────────────────────────────────────────────────────────
@@ -165,34 +175,34 @@ class SettingsCog:
             if len(args) < 2:
                 return await message.edit(content=S.ui_err("usage: enable <command>"))
             target = args[1].lower()
-            # BUG-2 FIX: discard from BOTH sets
-            _set_discard("_cmd_disabled", target)
+            # BUG-2 FIX: discard from selfbot's own set in-place
+            _sb_set_discard("_cmd_disabled", target)
             await message.edit(content=S.ui_ok(f"`{target}` enabled"))
 
-        # ── settings ──────────────────────────────────────────────────────────
+        # ── settings status ───────────────────────────────────────────────────
         elif cmd == "settings":
             sub = args[1].lower() if len(args) > 1 else "status"
             if sub == "status":
-                # Read selfbot's live PREFIX (may differ from S.PREFIX if recently changed)
-                m = _main()
-                live_prefix = getattr(m, "PREFIX", None) or S.PREFIX or "."
-                live_disabled = len(getattr(m, "_cmd_disabled", None) or set())
+                live_prefix  = _sb_get("PREFIX", S.PREFIX or ".")
+                live_disabled = _sb_get("_cmd_disabled", set())
                 rows = [
-                    f"  {S.DIM}prefix{S.RESET}          `{live_prefix}`",
-                    f"  {S.DIM}aliases{S.RESET}         {len(S._aliases)}",
-                    f"  {S.DIM}disabled cmds{S.RESET}   {live_disabled}",
+                    f"  {S.DIM}prefix{S.RESET}           `{live_prefix}`",
+                    f"  {S.DIM}aliases{S.RESET}          {len(S._aliases)}",
+                    f"  {S.DIM}disabled cmds{S.RESET}    {len(live_disabled)}",
                     f"  {S.DIM}per-cmd cooldowns{S.RESET} {len(S._cooldowns)}",
-                    f"  {S.DIM}server prefixes{S.RESET} {len(S._server_prefixes)}",
+                    f"  {S.DIM}server prefixes{S.RESET}  {len(S._server_prefixes)}",
+                    f"  {S.DIM}dispatcher linked{S.RESET} "
+                    f"{'yes' if _sb_globals() is not None else 'NO — restart required'}",
                 ]
                 await message.edit(content=S.ui_box("settings", rows))
             elif sub == "reset":
                 S._aliases.clear()
                 S._cooldowns.clear()
-                _set_discard("_cmd_disabled", "__all__")   # no-op but safe
-                m = _main()
-                if m:
-                    d = getattr(m, "_cmd_disabled", None)
-                    if isinstance(d, set): d.clear()
-                await message.edit(content=S.ui_ok("aliases, cooldowns and disabled list cleared"))
+                d = _sb_get("_cmd_disabled")
+                if isinstance(d, set):
+                    d.clear()
+                await message.edit(content=S.ui_ok(
+                    "aliases, cooldowns and disabled list cleared"))
             else:
-                await message.edit(content=S.ui_info("settings status  |  settings reset"))
+                await message.edit(content=S.ui_info(
+                    "settings status  |  settings reset"))
