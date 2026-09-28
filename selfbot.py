@@ -159,6 +159,7 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
+_cstate_ref = None   # set in _boot_cogs; lets setprefix update live prefix
 VERSION = "2.7.0"
 OWNER_ID = 1551632054574121051
 LOG_FILE = "message_log.txt"
@@ -1539,6 +1540,7 @@ async def _boot_cogs():
         cstate.MAIN_CLIENT = _MAIN_CLIENT
         cstate.TOKEN = TOKEN
         cstate.PREFIX = PREFIX
+        global _cstate_ref; _cstate_ref = cstate
         cstate.USER_AGENT = USER_AGENT
         cstate.VERSION = VERSION
         cstate.HAS_HCAPTCHA = HAS_HCAPTCHA
@@ -1972,9 +1974,13 @@ async def _dispatch_message(_client, message):
     if not message.content:
         return
 
-    effective_prefix = PREFIX
-    if message.guild and str(message.guild.id) in _server_prefixes:
-        effective_prefix = _server_prefixes[str(message.guild.id)]
+    # Read live prefix from state so setprefix takes effect immediately
+    effective_prefix = (
+        (getattr(_cstate_ref, "PREFIX", None) or PREFIX)
+        if _cstate_ref else PREFIX
+    )
+    if message.guild_id and str(message.guild_id) in _server_prefixes:
+        effective_prefix = _server_prefixes[str(message.guild_id)]
 
     if not message.content.startswith(effective_prefix):
         return
