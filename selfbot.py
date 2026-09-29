@@ -345,6 +345,13 @@ RED     = f"{ESC}[31m"
 BLUE    = f"{ESC}[34m"
 MAGENTA = f"{ESC}[35m"
 DIM     = f"{ESC}[2m"
+DARK    = f"{ESC}[30m"          # charcoal — used for :: separators
+BOLD    = f"{ESC}[1m"
+ULINE   = f"{ESC}[4m"
+CYAN2   = f"{ESC}[0;36m"       # explicit-reset cyan for command names
+WHITE2  = f"{ESC}[0;37m"       # explicit-reset white for descriptions
+BLUE2   = f"{ESC}[0;34m"       # explicit-reset blue for category
+BRAND   = f"{ESC}[0;35m{ESC}[1m{ESC}[4m"  # magenta+bold+underline for brand
 
 def _ansi_block(lines):
     result = "> ```ansi\n"
@@ -1021,9 +1028,9 @@ HELP_DATA = {
 
 def build_help_root(page=1):
     cats = list(HELP_DATA.keys())
-    total = max(1, math.ceil(len(cats)/10))
+    total = max(1, math.ceil(len(cats) / 10))
     page = max(1, min(page, total))
-    chunk = cats[(page-1)*10:(page-1)*10+10]
+    chunk = cats[(page-1)*10 : (page-1)*10+10]
     desc = {
         "general":"utilities, platform & status","quests":"quest completer & orb badge",
         "sniper":"nitro sniper, logger, extended snipe",
@@ -1036,36 +1043,63 @@ def build_help_root(page=1):
         "profileext":"avatar/banner download, notes, personal block",
         "reminders":"reminders, timers, webhook notifications",
         "pingtrack":"ping counters + mention log",
-        "meta":"config I/O, debug, status watch, uptime, github watch",
-        "ar":"auto-responder","voice":"voice channel controls + 24/7 vckeep",
+        "meta":"config I/O, debug, status watch, uptime",
+        "ar":"auto-responder rules",
+        "voice":"voice channel controls + 24/7 vckeep",
         "roles":"role introspection & colour",
-        "rpc":"rich presence — 6 slots, spotify, xbox, ps, vrchat, meta",
-        "fun":"fun & roleplay","tools":"tools & generators","host":"multi-account hosting",
+        "rpc":"rich presence — slots, spotify, xbox, ps, vrchat",
+        "fun":"fun & roleplay",
+        "tools":"tools & generators",
+        "host":"multi-account hosting",
         "admin":"owner / admin management",
-        "lastfm":"last.fm integration","settings":"prefix, aliases, cooldowns, profiles",
-        "guards":"blacklists, whitelists, restrictions, per-cmd toggles",
-        "resilience":"auto-reconnect, session log, rate limits, cache, queue",
-        "tasks":"background task manager","triggers":"message / reaction / voice / member triggers",
-        "developer":"dev tools, plugins, proxy, sessions, access",
+        "lastfm":"last.fm integration",
+        "settings":"prefix, aliases, cooldowns",
+        "guards":"blacklists, whitelists, per-cmd toggles",
+        "resilience":"auto-reconnect, session log, rate limits",
+        "tasks":"background task manager",
+        "triggers":"message / reaction / voice / member triggers",
+        "developer":"eval, plugins, proxy, sessions",
         "server":"server management",
-        "information":"user & server lookup","groupchat":"group dm & anti-gc",
-        "utility":"text, afk, translate","tracking":"message & profile tracking",
-        "downloads":"media downloader","social":"friends & social",
+        "information":"user & server lookup",
+        "groupchat":"group dm & anti-gc",
+        "utility":"text transforms, translate",
+        "tracking":"message & profile tracking",
+        "downloads":"media downloader",
+        "social":"friends & social",
         "auto":"automation, snipers, superreact",
-        "spoofer":"platform / device spoofing — pool + rotation",
-        "multispoof":"concurrent sessions — 4+ device badges at once",
-        "profile":"account profile","status":"custom status",
-        "mass":"mass action tools","nuke":"destructive ops + backup","scrape":"scrape & export",
-        "webhooks":"webhooks & emoji tools","automod":"automod, raid, quarantine, tickets, verify",
-        "monitor":"event monitoring & alerts","backup":"server backup & restore",
-        "perms":"per-command permissions","scheduler":"scheduled actions",
-        "db":"local database & stats","interactions":"button & modal handling",
+        "spoofer":"platform / device spoofing",
+        "multispoof":"concurrent sessions — 4+ device badges",
+        "profile":"account profile editing",
+        "status":"custom status management",
+        "mass":"mass action tools",
+        "nuke":"destructive ops + backup",
+        "scrape":"scrape & export",
+        "webhooks":"webhooks & emoji tools",
+        "automod":"automod, raid, quarantine, tickets",
+        "monitor":"event monitoring & alerts",
+        "backup":"server backup & restore",
+        "perms":"per-command permissions",
+        "scheduler":"scheduled actions",
+        "db":"local database & stats",
+        "interactions":"button & modal handling",
     }
-    lines = [f"  {WHITE}> wilt{RESET}  {DIM}v{VERSION}{RESET}", "", f"  {GREY}categories{RESET}", ""]
+    pfx = _live_prefix[0]
+    col = max((len(c) for c in chunk), default=8)
+
+    lines = [
+        f"  {WHITE}> wilt{RESET}  {DIM}v{VERSION}{RESET}",
+        f"  {GREY}categories{RESET}",
+        "",
+    ]
     for c in chunk:
-        lines.append(f"  {CYAN}{c:<14}{RESET}  {DIM}{desc.get(c,'commands')}{RESET}")
-    lines += ["", f"  {DIM}{PREFIX}help <category> [page]  •  {PREFIX}help <page> to flip{RESET}",
-              f"  {DIM}page {page}/{total}  •  wilt | ver {VERSION}{RESET}"]
+        pad = col - len(c)
+        lines.append(
+            f"  {CYAN}{c}{' ' * pad}{RESET}  {DIM}{desc.get(c, 'commands')}{RESET}")
+    lines += [
+        "",
+        f"  {DIM}{pfx}help <category> [page]  •  {pfx}help <page> to flip{RESET}",
+        f"  {DIM}page {page}/{total}  •  wilt | ver {VERSION}{RESET}",
+    ]
     return _ansi_block(lines)
 
 def build_help_section(cat, page=1):
@@ -1075,11 +1109,31 @@ def build_help_section(cat, page=1):
     total = max(1, math.ceil(len(rows)/PAGE_SIZE))
     page = max(1, min(page, total))
     chunk = rows[(page-1)*PAGE_SIZE:(page-1)*PAGE_SIZE+PAGE_SIZE]
-    lines = [f"  {WHITE}> {cat}{RESET}", ""]
+    pfx = _live_prefix[0]
+
+    # ── column width: longest command name in this chunk ──────────────────────
+    col = max((len(c) for c, _ in chunk), default=8)
+
+    # ── block 1: header ───────────────────────────────────────────────────────
+    hdr = (f"{BRAND}wilt{RESET}"
+           f"{DARK} :: {RESET}"
+           f"{WHITE2}v{VERSION}{RESET}"
+           f"{DARK} :: {RESET}"
+           f"{BLUE2}{cat}{RESET}")
+    block1 = f"> ```ansi\n> {hdr}\n> ```"
+
+    # ── block 2: commands ─────────────────────────────────────────────────────
+    cmd_lines = []
     for c, d in chunk:
-        lines.append(f"  {GREY}├{RESET} {WHITE}{PREFIX}{c}{RESET}  {DIM}{d}{RESET}")
-    lines += ["", f"  {DIM}page {page}/{total}  •  {PREFIX}h {cat} {(page%total)+1}{RESET}"]
-    return _ansi_block(lines)
+        pad = col - len(c)
+        cmd_lines.append(
+            f"> {CYAN2}{c}{' ' * pad}{RESET}{DARK}:: {RESET}{WHITE2}{d}{RESET}")
+    block2 = "> ```ansi\n" + "\n".join(cmd_lines) + "\n> ```"
+
+    # ── block 3: footer ───────────────────────────────────────────────────────
+    block3 = f"> ```ansi\n> {DARK}{pfx}help {cat} [{page}-{total}]{RESET}\n> ```"
+
+    return "\n".join([block1, block2, block3])
 
 # ─────────────────────────────────────────────
 # STATE
