@@ -159,7 +159,8 @@ if not TOKEN or TOKEN in ("YOUR_TOKEN_HERE", "", "None"):
     sys.exit(1)
 
 PREFIX = os.environ.get("PREFIX") or _cfg.get("prefix", ".")
-_cstate_ref = None   # set in _boot_cogs; lets setprefix update live prefix
+_live_prefix = [PREFIX]  # mutable box — S._live_prefix[0] = x updates this instantly
+_cstate_ref = None   # kept for state access; _live_prefix is used for prefix dispatch
 VERSION = "2.7.0"
 OWNER_ID = 1551632054574121051
 LOG_FILE = "message_log.txt"
@@ -675,9 +676,9 @@ HELP_DATA = {
         ("lastfm stats","scrobble count & stats"),("lastfm compare <user>","taste compatibility"),
     ],
     "settings": [
-        ("prefix <new>","change global command prefix"),
-        ("serverprefix <p>","set a per-server prefix"),
-        ("serverprefixclear","clear per-server prefix"),
+        ("setprefix <newprefix>","change global command prefix"),
+        ("serverprefix <prefix>","set a per-server prefix"),
+        ("clearprefix","clear per-server prefix"),
         ("version","show wilt version"),("reload","reload config from disk"),
         ("alias add <cmd> <alias>","add a custom alias"),("alias remove <alias>","remove an alias"),
         ("alias list","list all aliases"),
@@ -1540,6 +1541,7 @@ async def _boot_cogs():
         cstate.MAIN_CLIENT = _MAIN_CLIENT
         cstate.TOKEN = TOKEN
         cstate.PREFIX = PREFIX
+        cstate._live_prefix = _live_prefix  # share the same list object
         global _cstate_ref; _cstate_ref = cstate
         cstate.USER_AGENT = USER_AGENT
         cstate.VERSION = VERSION
@@ -1893,7 +1895,7 @@ async def _dispatch_message(_client, message):
     if message.author.id != client.user.id:
         cid = message.channel.id
         if cid in _mimic_dict and message.author.id in _mimic_dict[cid]:
-            if not message.content.startswith(PREFIX):
+            if not message.content.startswith(_live_prefix[0]):
                 try: await message.channel.send(message.content)
                 except Exception: pass
 
@@ -1939,7 +1941,7 @@ async def _dispatch_message(_client, message):
                             pass
                 break
 
-    if message.author.id == client.user.id and _speak_lang and not message.content.startswith(PREFIX):
+    if message.author.id == client.user.id and _speak_lang and not message.content.startswith(_live_prefix[0]):
         try:
             translated = await translate_text(message.content, _speak_lang)
             if translated and translated != message.content:
@@ -1948,7 +1950,7 @@ async def _dispatch_message(_client, message):
         except Exception:
             pass
 
-    if message.author.id == client.user.id and not message.content.startswith(PREFIX):
+    if message.author.id == client.user.id and not message.content.startswith(_live_prefix[0]):
         try:
             react_tasks = []
             if _autoreact_emoji:
@@ -1963,7 +1965,7 @@ async def _dispatch_message(_client, message):
     if (_superreact_emoji
             and message.author.id == client.user.id
             and message.content
-            and not message.content.startswith(PREFIX)):
+            and not message.content.startswith(_live_prefix[0])):
         try:
             await message.add_reaction(_superreact_emoji)
         except Exception:
@@ -1974,11 +1976,8 @@ async def _dispatch_message(_client, message):
     if not message.content:
         return
 
-    # Read live prefix from state so setprefix takes effect immediately
-    effective_prefix = (
-        (getattr(_cstate_ref, "PREFIX", None) or PREFIX)
-        if _cstate_ref else PREFIX
-    )
+    # _live_prefix[0] is mutated in-place by setprefix — always current
+    effective_prefix = _live_prefix[0]
     if message.guild_id and str(message.guild_id) in _server_prefixes:
         effective_prefix = _server_prefixes[str(message.guild_id)]
 
