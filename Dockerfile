@@ -1,5 +1,5 @@
 # Dockerfile — repo root
-FROM python:3.9-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 ENV PIP_NO_CACHE_DIR=1 \

@@ -1,4 +1,4 @@
-# selfbot.py | Python 3.10+ | modifyself + aiohttp + hcaptcha-challenger
+# selfbot.py | Python 3.10 | modifyself + aiohttp + hcaptcha-challenger
 # wilt — v2.6.0
 
 import modifyself_shim as discord
