@@ -19,6 +19,8 @@ import time
 import os
 import traceback
 from datetime import datetime, timedelta
+from . import state as S
+import modifyself_shim as discord
 
 try:
     from utils.ascii_helper import AsciiHelper

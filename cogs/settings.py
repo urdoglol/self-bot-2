@@ -35,9 +35,13 @@ class SettingsCog:
                 return await message.edit(
                     content=S.ui_err("usage: setprefix <prefix>"))
             new_prefix = args[1]
-            # selfbot._dispatch_message now reads S.PREFIX on every message
-            # so this single assignment takes effect immediately
-            S.PREFIX = new_prefix
+            # Mutate the shared _live_prefix list in-place.
+            # selfbot and state both hold the same list — _live_prefix[0]
+            # is what _dispatch_message reads on every message.
+            S.PREFIX = new_prefix  # keep S.PREFIX in sync for display
+            lp = getattr(S, "_live_prefix", None)
+            if isinstance(lp, list):
+                lp[0] = new_prefix
             cfg = S.load_config() or {}
             cfg["prefix"] = new_prefix
             S.save_config(cfg)
