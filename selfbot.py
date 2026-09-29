@@ -354,11 +354,10 @@ BLUE2   = f"{ESC}[0;34m"       # explicit-reset blue for category
 BRAND   = f"{ESC}[0;35m{ESC}[1m{ESC}[4m"  # magenta+bold+underline for brand
 
 def _ansi_block(lines):
-    result = "> ```ansi\n"
+    inner = ""
     for line in lines:
-        result += ("> \n" if line.strip() == "" else f"> {line}\n")
-    result += "> ```"
-    return "\n".join(l for l in result.split("\n") if not re.match(r'^>\s*$', l))
+        inner += ("\n" if line.strip() == "" else f"{line}\n")
+    return f"```ansi\n{inner.rstrip()}\n```"
 
 def ui_box(title, rows, footer=""):
     lines = [f"  {WHITE}{title}{RESET}"] + list(rows)
@@ -699,7 +698,20 @@ HELP_DATA = {
         ("enable <cmd>","enable a disabled command"),("disable <cmd>","disable a command"),
         ("disabled","list disabled commands"),
     ],
+    "protect": [
+        ("protect on/off",     "enable / disable all account protection"),
+        ("protect logch <id>", "channel to receive all protect alerts"),
+        ("protect sweep",      "immediately leave any server with a dangerous name"),
+        ("protect nuke <n> <s>","auto-leave if N channels deleted in S seconds"),
+        ("protect memberloss <n> <s>","auto-leave on mass member loss"),
+        ("protect patterns",   "list all danger name patterns"),
+        ("protect status",     "show all thresholds and state"),
+    ],
     "guards": [
+        ("serverguard on/off",  "auto-leave if a server renames to a TOS-violating name"),
+        ("serverguard add <kw>","add a keyword that triggers auto-leave"),
+        ("serverguard list",    "show all active guard keywords"),
+        ("serverguard logch <id>","channel to log auto-leave events"),
         ("blacklist add <uid>","add a user to the blacklist"),
         ("blacklist remove <uid>","remove from blacklist"),
         ("blacklist list","show blacklisted users"),
@@ -1084,7 +1096,6 @@ def build_help_root(page=1):
         "interactions":"button & modal handling",
     }
     pfx = _live_prefix[0]
-    col = max((len(c) for c in chunk), default=8)
 
     lines = [
         f"  {WHITE}> wilt{RESET}  {DIM}v{VERSION}{RESET}",
@@ -1092,9 +1103,7 @@ def build_help_root(page=1):
         "",
     ]
     for c in chunk:
-        pad = col - len(c)
-        lines.append(
-            f"  {CYAN}{c}{' ' * pad}{RESET}  {DIM}{desc.get(c, 'commands')}{RESET}")
+        lines.append(f"  {CYAN}{c}{RESET}")
     lines += [
         "",
         f"  {DIM}{pfx}help <category> [page]  •  {pfx}help <page> to flip{RESET}",
@@ -1549,6 +1558,7 @@ COG_MODULES = [
     ("cogs.triggers", "TriggersCog"),
     ("cogs.tasks", "TasksCog"),
     ("cogs.guards", "GuardsCog"),
+    ("cogs.protect", "ProtectCog"),
     ("cogs.resilience", "ResilienceCog"),
     ("cogs.settings", "SettingsCog"),
     ("cogs.general", "GeneralCog"),
@@ -2165,6 +2175,11 @@ async def _dispatch_message(_client, message):
 
 @client.event
 async def on_message(message):
+    try:
+        from cogs.protect import on_message_hook
+        await on_message_hook(message)
+    except Exception:
+        pass
     await _dispatch_message(client, message)
 
 # ─────────────────────────────────────────────
@@ -2286,6 +2301,44 @@ async def on_member_update(before, after):
         if ch:
             try: await ch.send(ui_box("nick", [f"{after} updated"]))
             except Exception: pass
+
+
+@client.event
+async def on_guild_update(before, after):
+    """Protect: TOS keyword rename detection."""
+    try:
+        from cogs.protect import on_guild_update_hook
+        await on_guild_update_hook(before, after)
+    except Exception as e:
+        print(f"[protect] on_guild_update: {e}")
+
+
+@client.event
+async def on_guild_remove(guild):
+    try:
+        from cogs.protect import on_guild_remove_hook
+        await on_guild_remove_hook(guild)
+    except Exception as e:
+        print(f"[protect] on_guild_remove: {e}")
+
+
+@client.event
+async def on_guild_channel_delete(channel):
+    try:
+        from cogs.protect import on_guild_channel_delete_hook
+        await on_guild_channel_delete_hook(channel)
+    except Exception as e:
+        print(f"[protect] on_guild_channel_delete: {e}")
+
+
+@client.event
+async def on_member_remove(member):
+    try:
+        from cogs.protect import on_member_remove_hook
+        await on_member_remove_hook(member)
+    except Exception as e:
+        print(f"[protect] on_member_remove: {e}")
+
 
 # ─────────────────────────────────────────────
 # SIGNAL HANDLING + RUN
